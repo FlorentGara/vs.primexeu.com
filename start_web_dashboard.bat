@@ -1,0 +1,7 @@
+@echo off
+cd /d "%~dp0"
+set VS_DASHBOARD_HOST=0.0.0.0
+set VS_DASHBOARD_PORT=8780
+set VS_FILE_ROOT=\\192.168.10.8\klientat\05_CLIENTS\02_VS\00_TEMPLATE\FILLED\AMAZON\01_WINE-SPIRITS\FINAL\PICTURE
+set VS_SCRIPT_ROOT=%~dp0
+py -3 -m waitress --host=%VS_DASHBOARD_HOST% --port=%VS_DASHBOARD_PORT% web_dashboard:app

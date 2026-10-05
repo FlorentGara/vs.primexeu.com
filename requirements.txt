@@ -1,0 +1,7 @@
+flask
+waitress
+pillow
+numpy
+pandas
+openpyxl
+requests

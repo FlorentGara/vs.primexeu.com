@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import cgi
+from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import hmac
@@ -1233,6 +1234,151 @@ def fill_excel_urls(
         return output, {"changed": changed, "missing": missing, "skipped": skipped}
 
 
+GEWICHT_QUANTITIES = (1, 3, 6, 12)
+GEWICHT_CARTONS = (180, 540, 1120, 2120)
+
+
+def parse_gewicht_value(value: object, excel_row: int, header_unit: str = "") -> tuple[Decimal, str]:
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"Row {excel_row}: Gewicht is empty or invalid.")
+    raw = str(value).strip().replace(" ", "").replace("\u00a0", "")
+    match = re.fullmatch(r"([+-]?(?:\d+[.,]?)*\d+)(kg|g|mg)?", raw, re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Row {excel_row}: invalid Gewicht value {value!r}.")
+    number_text, explicit_unit = match.groups()
+    if "," in number_text and "." in number_text:
+        number_text = number_text.replace(".", "").replace(",", ".")
+    else:
+        number_text = number_text.replace(",", ".")
+    try:
+        number = Decimal(number_text)
+    except InvalidOperation as exc:
+        raise ValueError(f"Row {excel_row}: invalid Gewicht value {value!r}.") from exc
+    if not number.is_finite() or number < 0:
+        raise ValueError(f"Row {excel_row}: Gewicht must be a non-negative number.")
+    unit = (explicit_unit or header_unit).lower()
+    if not unit:
+        whole = number_text.lstrip("+-").split(".", 1)[0]
+        unit = "mg" if len(whole) >= 2 else "g"
+    if unit == "kg":
+        return number * 1000000, unit
+    if unit == "g":
+        return number * 1000, unit
+    return number, unit
+
+
+def gewicht_excel_number(number: Decimal) -> int | float:
+    return int(number) if number == number.to_integral_value() else float(number)
+
+
+def build_gewicht_workbook(source_file: Path, prefix: str = "AM", input_unit: str = "g", end_prefix: str = "") -> tuple[Path, int]:
+    try:
+        from openpyxl import Workbook, load_workbook
+        from openpyxl.styles import Font, PatternFill
+    except ImportError as exc:
+        raise ValueError("Excel support is not installed on the server.") from exc
+    prefix = prefix.strip()
+    if not prefix or not re.fullmatch(r"[A-Za-z0-9]+", prefix):
+        raise ValueError("Prefix must contain only letters and numbers.")
+    input_unit = input_unit.strip().lower()
+    if input_unit not in {"g", "mg"}:
+        raise ValueError("Choose g or mg for the uploaded weight.")
+    end_prefix = end_prefix.strip()
+    if end_prefix and not re.fullmatch(r"[A-Za-z0-9]+", end_prefix):
+        raise ValueError("The optional final code must contain only letters and numbers.")
+    source = load_workbook(source_file, read_only=True, data_only=True)
+    try:
+        sheet = source.active
+        rows = sheet.iter_rows(values_only=True)
+        try:
+            header = next(rows)
+        except StopIteration as exc:
+            raise ValueError("Excel file is empty.") from exc
+        first = str(header[0] or "").strip().casefold() if len(header) > 0 else ""
+        second = str(header[1] or "").strip().casefold() if len(header) > 1 else ""
+        if first not in {"artikel nr", "artikel nr.", "artikelnummer", "artikel-nr", "artikel-nr."} or not second.startswith("gewicht"):
+            raise ValueError("First row must contain 'Artikel Nr' and 'Gewicht' in columns A and B.")
+        has_total_columns = (len(header) > 5 and str(header[4] or "").strip().casefold().startswith("karton")
+                             and str(header[5] or "").strip().casefold().startswith("gewicht"))
+        has_product_column = len(header) > 3 and str(header[3] or "").strip().casefold().startswith("produktgewicht")
+        input_rows = []
+        for excel_row, row in enumerate(rows, start=2):
+            article = row[0] if len(row) > 0 else None
+            weight = row[1] if len(row) > 1 else None
+            if article is None and weight is None:
+                continue
+            if article is None or str(article).strip() == "":
+                raise ValueError(f"Row {excel_row}: Artikel Nr is missing.")
+            if weight is None or str(weight).strip() == "":
+                milligrams, unit = None, ""
+                quantity_value = row[2] if len(row) > 2 else None
+                try:
+                    quantity = Decimal(str(quantity_value).strip())
+                    if not quantity.is_finite() or quantity <= 0:
+                        raise InvalidOperation
+                    if has_total_columns and len(row) > 5 and row[4] is not None and row[5] is not None:
+                        total, _ = parse_gewicht_value(row[5], excel_row, "mg")
+                        carton, _ = parse_gewicht_value(row[4], excel_row, "mg")
+                        milligrams = (total - carton) / quantity
+                    elif has_product_column and len(row) > 3 and row[3] is not None:
+                        product, _ = parse_gewicht_value(row[3], excel_row, "mg")
+                        milligrams = product / quantity
+                    if milligrams is not None and milligrams < 0:
+                        raise ValueError(f"Row {excel_row}: derived Gewicht must not be negative.")
+                    if milligrams is not None:
+                        weight, unit = gewicht_excel_number(milligrams), "mg"
+                except (InvalidOperation, TypeError):
+                    pass
+            else:
+                milligrams, unit = parse_gewicht_value(weight, excel_row, input_unit)
+            input_rows.append((article, weight, milligrams, unit))
+        if not input_rows:
+            raise ValueError("No product rows found in the Excel file.")
+        source_units = {unit for _, _, _, unit in input_rows if unit}
+        has_conversion = any(unit != "mg" for unit in source_units)
+        output = Workbook()
+        result = output.active
+        result.title = "GEWICHT"
+        original_unit = next(iter(source_units)) if len(source_units) == 1 else ""
+        original_header = f"Gewicht ({original_unit})" if original_unit else ("Gewicht (mg)" if not source_units else "Gewicht (siç u dërgua)")
+        headers = ["Artikel Nr", "Artikel Code", original_header]
+        if has_conversion:
+            headers.append("Gewicht (mg)")
+        headers.extend(["Anzahl Flaschen", "Produktgewicht (mg)", "Karton (mg)", "GEWICHT (mg)"])
+        if end_prefix:
+            headers.append("Artikel Code (në fund)")
+        result.append(headers)
+        for cell in result[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="0F766E")
+        for count, (article, weight, milligrams, unit) in enumerate(input_rows):
+            variant = count % 4
+            quantity = GEWICHT_QUANTITIES[variant]
+            carton = GEWICHT_CARTONS[variant]
+            product = milligrams * quantity if milligrams is not None else None
+            total = product + carton if product is not None else None
+            article_text = str(int(article)) if isinstance(article, float) and article.is_integer() else str(article).strip()
+            values = [article, f"{quantity:02d}-{prefix}{article_text}", weight]
+            if has_conversion:
+                values.append(gewicht_excel_number(milligrams) if unit != "mg" and milligrams is not None else None)
+            values.extend([quantity, gewicht_excel_number(product) if product is not None else None,
+                           carton if milligrams is not None else None,
+                           gewicht_excel_number(total) if total is not None else None])
+            if end_prefix:
+                values.append(f"{quantity:02d}-{end_prefix}{article_text}")
+            result.append(values)
+        for column in result.columns:
+            result.column_dimensions[column[0].column_letter].width = max(18, min(28, len(str(column[0].value)) + 3))
+        result.freeze_panes = "A2"
+        result.auto_filter.ref = result.dimensions
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as temp:
+            output_path = Path(temp.name)
+        output.save(output_path)
+        return output_path, len(input_rows)
+    finally:
+        source.close()
+
+
 def fill_excel_urls_workbook(
     source_file: Path,
     original_name: str,
@@ -1513,6 +1659,7 @@ def shell(title: str, active: str, main: str) -> bytes:
         "urls": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path></svg>',
         "excel": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"></path><path d="M14 2v6h6"></path><path d="M8 13h8"></path><path d="M8 17h5"></path></svg>',
         "riegel": '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path><path d="M8 11h6"></path><path d="M11 8v6"></path></svg>',
+        "gewicht": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16"></path><path d="M6 20 9 8h6l3 12"></path><circle cx="12" cy="5" r="2"></circle></svg>',
     }
     nav = f"""
       <div class="brand-wrap">
@@ -1527,6 +1674,7 @@ def shell(title: str, active: str, main: str) -> bytes:
         <a class="{'active' if active == 'urls' else ''}" href="/url-generator">{icons['urls']}<span>URL Generator</span></a>
         <a class="{'active' if active == 'excel' else ''}" href="/excel-url-filler">{icons['excel']}<span>Excel URL Filler</span></a>
         <a class="{'active' if active == 'riegel' else ''}" href="/riegel-logo-scanner">{icons['riegel']}<span>Riegel Logo Scanner</span></a>
+        <a class="{'active' if active == 'gewicht' else ''}" href="/gewicht">{icons['gewicht']}<span>GEWICHT</span></a>
       </nav>
       <a class="logout" href="/logout">Sign out</a>
     """
@@ -1642,6 +1790,25 @@ EXCEL_PAGE = """
   <div class="status" id="status"></div>
 </section>
 <section class="panel"><h2>Rules Used</h2><div class="hint">Example: <strong>03-KRN24bio</strong> becomes folder <strong>KR/N24</strong>, main image <strong>3.jpg</strong>, and other image <strong>1.jpg</strong>.</div></section>
+"""
+
+
+GEWICHT_PAGE = """
+<h1>GEWICHT</h1>
+<p class="hint">Ngarko një Excel me dy kolonat <strong>Artikel Nr</strong> dhe <strong>Gewicht</strong>. Shkarko Excel-in e ri me llogaritjen për çdo rresht.</p>
+<section class="panel">
+  <div class="field"><label for="gewichtFile">Excel (.xlsx ose .xlsm)</label><input id="gewichtFile" type="file" accept=".xlsx,.xlsm"></div>
+  <div class="field"><label for="gewichtPrefix">Prefiksi i kodit të artikullit</label><input id="gewichtPrefix" value="AM" placeholder="P.sh. AM" maxlength="20" required></div>
+  <div class="field"><label for="gewichtUnit">Njësia e peshës në Excel</label><select id="gewichtUnit"><option value="g">Gramë (g) — kthe në mg</option><option value="mg">Miligramë (mg) — pa konvertim</option></select></div>
+  <div class="field full"><label for="gewichtEndPrefix">Prefiksi shtesë për kodin në kolonën e fundit (opsional)</label><input id="gewichtEndPrefix" placeholder="P.sh. KR; lëre bosh për të mos shtuar kolonë" maxlength="20"></div>
+  <div class="actions"><button id="gewichtBtn">Llogarit dhe shkarko Excel</button></div>
+  <div class="status" id="status" role="status"></div>
+</section>
+<section class="panel">
+  <h2>Rregullat e llogaritjes</h2>
+  <p class="hint">Zgjidh g ose mg para ngarkimit. Kur zgjedh g, pesha origjinale ruhet dhe shtohet kolona e konvertuar në mg (1 g = 1000 mg). Kur zgjedh mg, nuk bëhet konvertim. Vlerat me njësi të shkruar brenda qelizës lexohen sipas asaj njësie.</p>
+  <p class="hint">Numri i shisheve përsëritet 1, 3, 6, 12. Kartoni përkatës është 180, 540, 1120, 2120 mg. GEWICHT = pesha në mg × numri i shisheve + kartoni. Kodi krijohet si 01-AM5657, 03-AM5657, 06-AM5657, 12-AM5657, sipas prefiksit të zgjedhur.</p>
+</section>
 """
 
 
@@ -1772,6 +1939,32 @@ document.getElementById("checkUrlBtn")?.addEventListener("click",()=>checkUrls()
 document.getElementById("gridBtn")?.addEventListener("click",()=>generateGrid().catch(err=>status(err.message)));
 document.getElementById("organizeBtn")?.addEventListener("click",()=>organizePhotos().catch(err=>status(err.message)));
 document.getElementById("uploadBtn")?.addEventListener("click",()=>uploadFiles().catch(err=>status(err.message)));
+async function calculateGewicht(){
+  const input=document.getElementById("gewichtFile");
+  const file=input?.files[0];
+  if(!file){status("Zgjidh një skedar Excel.");return;}
+  const button=document.getElementById("gewichtBtn");
+  button.disabled=true;
+  status("Duke përpunuar Excel-in...");
+  try{
+    const prefix=document.getElementById("gewichtPrefix")?.value.trim();
+    if(!/^[A-Za-z0-9]+$/.test(prefix||"")){throw new Error("Shkruaj një prefiks me shkronja ose numra.");}
+    const form=new FormData();form.append("file",file);form.append("prefix",prefix);
+    form.append("input_unit",document.getElementById("gewichtUnit")?.value||"g");
+    const endPrefix=document.getElementById("gewichtEndPrefix")?.value.trim()||"";
+    if(endPrefix&&!/^[A-Za-z0-9]+$/.test(endPrefix)){throw new Error("Prefiksi shtesë duhet të ketë vetëm shkronja ose numra.");}
+    form.append("end_prefix",endPrefix);
+    const response=await fetch("/api/gewicht",{method:"POST",body:form});
+    if(!response.ok){const error=await response.json();throw new Error(error.error||"Përpunimi dështoi.");}
+    const blob=await response.blob();
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement("a");link.href=url;link.download="GEWICHT-"+file.name.replace(/\.(xlsx|xlsm)$/i,"")+".xlsx";
+    document.body.appendChild(link);link.click();link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),60000);
+    status("U përpunuan "+response.headers.get("X-Gewicht-Rows")+" rreshta. Shkarkimi filloi.");
+  }finally{button.disabled=false;}
+}
+document.getElementById("gewichtBtn")?.addEventListener("click",()=>calculateGewicht().catch(err=>status(err.message)));
 document.getElementById("excelBtn")?.addEventListener("click",()=>fillExcelUrls().catch(err=>status(err.message)));
 document.getElementById("riegelScanBtn")?.addEventListener("click",()=>scanRiegelLogos().catch(err=>status(err.message)));
 document.getElementById("copyRiegelHitsBtn")?.addEventListener("click",()=>copyRiegelHits().catch(err=>status(err.message)));
@@ -1891,6 +2084,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if route == "/excel-url-filler":
                 self.send_html(shell("Excel URL Filler", "excel", EXCEL_PAGE))
+                return
+            if route == "/gewicht":
+                self.send_html(shell("GEWICHT", "gewicht", GEWICHT_PAGE))
                 return
             if route == "/riegel-logo-scanner":
                 self.send_html(shell("Riegel Logo Scanner", "riegel", RIEGEL_PAGE))
@@ -2016,7 +2212,7 @@ class Handler(BaseHTTPRequestHandler):
                 thread.start()
                 self.send_json({"job_id": job_id, "done": False})
                 return
-            if route not in {"/api/upload", "/api/fill-excel"}:
+            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht"}:
                 self.send_json({"error": "Not found"}, 404)
                 return
             content_type = self.headers.get("Content-Type", "")
@@ -2031,6 +2227,32 @@ class Handler(BaseHTTPRequestHandler):
                     "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
                 },
             )
+            if route == "/api/gewicht":
+                field = form["file"] if "file" in form else None
+                if field is None or not getattr(field, "filename", ""):
+                    raise ValueError("Choose an Excel file.")
+                original_name = safe_upload_filename(field.filename)
+                suffix = Path(original_name).suffix.lower()
+                if suffix not in {".xlsx", ".xlsm"}:
+                    raise ValueError("Upload an .xlsx or .xlsm file.")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
+                    source_path = Path(temp.name)
+                    while chunk := field.file.read(1024 * 1024):
+                        temp.write(chunk)
+                output_path = None
+                try:
+                    output_path, count = build_gewicht_workbook(source_path, form.getfirst("prefix", "AM"), form.getfirst("input_unit", "g"), form.getfirst("end_prefix", ""))
+                    self.send_download(
+                        output_path,
+                        "GEWICHT.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        {"X-Gewicht-Rows": str(count), "Access-Control-Expose-Headers": "X-Gewicht-Rows"},
+                    )
+                finally:
+                    source_path.unlink(missing_ok=True)
+                    if output_path is not None:
+                        output_path.unlink(missing_ok=True)
+                return
             if route == "/api/fill-excel":
                 field = form["file"] if "file" in form else None
                 if field is None or not getattr(field, "filename", ""):

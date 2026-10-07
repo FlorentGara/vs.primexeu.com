@@ -1,0 +1,57 @@
+name: Deploy vs.primexeu.com
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: vs-primexeu-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DEPLOY_HOST: 146.59.150.247   # primex-ovh
+    steps:
+      - name: Check deploy key
+        id: key
+        env:
+          VS_DEPLOY_SSH_KEY: ${{ secrets.VS_DEPLOY_SSH_KEY }}
+        run: |
+          if [ -z "$VS_DEPLOY_SSH_KEY" ]; then
+            echo "::warning::Secret VS_DEPLOY_SSH_KEY is not set yet - skipping deploy."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.key.outputs.ready == 'true'
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        if: steps.key.outputs.ready == 'true'
+        env:
+          VS_DEPLOY_SSH_KEY: ${{ secrets.VS_DEPLOY_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VS_DEPLOY_SSH_KEY" > ~/.ssh/vs_deploy
+          chmod 600 ~/.ssh/vs_deploy
+          # pinned host key of the server
+          echo "$DEPLOY_HOST ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIArYS3x+uNAYH2EakPkg2LqkaFAvxStwxferobVoOncw" > ~/.ssh/known_hosts
+
+      # The key can only run the deploy script on the server: it installs requirements,
+      # smoke-tests the release on a spare port, switches it live, health-checks and rolls back on failure.
+      - name: Deploy
+        if: steps.key.outputs.ready == 'true'
+        run: |
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/release.tar.gz"
+          ssh -i ~/.ssh/vs_deploy -o BatchMode=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=30 \
+            vs-deploy@$DEPLOY_HOST "$GITHUB_SHA" < "$RUNNER_TEMP/release.tar.gz"
+
+      - name: Verify public site
+        if: steps.key.outputs.ready == 'true'
+        run: curl -fsS -m 20 -o /dev/null -w "vs.primexeu.com/login -> %{http_code}\n" https://vs.primexeu.com/login

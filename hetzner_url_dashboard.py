@@ -1721,6 +1721,7 @@ def shell(title: str, active: str, main: str) -> bytes:
         <a class="{'active' if active == 'riegel' else ''}" href="/riegel-logo-scanner">{icons['riegel']}<span>Riegel Logo Scanner</span></a>
         <a class="{'active' if active == 'gewicht' else ''}" href="/gewicht">{icons['gewicht']}<span>Gewicht</span></a>
         <a class="{'active' if active == 'amazon' else ''}" href="/find-url-amazon">{icons['urls']}<span>Find URL Amazon</span></a>
+        <a class="{'active' if active == 'variacionet' else ''}" href="/variacionet">{icons['excel']}<span>Variacionet</span></a>
       </nav>
       <a class="logout" href="/logout">Sign out</a>
     """
@@ -1849,6 +1850,18 @@ AMAZON_PAGE = """
   <div class="status" id="status" role="status"></div>
 </section>
 <section class="panel"><h2>Results</h2><div id="amazonTable" class="hint">No ASINs checked yet.</div></section>
+"""
+
+
+VARIACIONET_PAGE = """
+<h1>Variacionet</h1>
+<p class="hint">Ngarko Excel ose CSV me kolonat <strong>druck_pseudonym</strong>, <strong>lager_nr</strong> dhe <strong>set_article</strong>. Programi ploteson set_article per variacionet duke perdorur lager_nr te artikullit me nje shishe. Vlerat ekzistuese ruhen.</p>
+<section class="panel">
+  <div class="field"><label for="variacionetFile">Excel ose CSV (.xlsx, .xlsm, .csv)</label><input id="variacionetFile" type="file" accept=".xlsx,.xlsm,.csv"></div>
+  <div class="actions"><button id="variacionetBtn">Ploteso variacionet dhe shkarko</button></div>
+  <div class="status" id="status" role="status"></div>
+</section>
+<section class="panel"><h2>Rezultati</h2><div id="variacionetResult" class="hint">Ende nuk eshte perpunuar asnje skedar.</div></section>
 """
 
 
@@ -2003,6 +2016,26 @@ function renderAmazonTable(rows){const wrap=document.getElementById("amazonTable
 async function findAmazonUrls(){const file=document.getElementById("amazonFile")?.files[0];if(!file){status("Choose an Excel file with ASINs in column A.");return;}const button=document.getElementById("amazonFindBtn");const download=document.getElementById("amazonDownloadBtn");button.disabled=true;download.style.display="none";status("Uploading ASINs...");setAmazonProgress(3,"Uploading Excel...",true);try{const form=new FormData();form.append("file",file);const response=await fetch("/api/find-url-amazon",{method:"POST",body:form});const started=await parseJsonResponse(response);if(!response.ok)throw new Error(started.error||"Amazon lookup failed.");const jobId=started.job_id;while(true){const data=await api(`/api/job?id=${encodeURIComponent(jobId)}`);renderAmazonTable(data.rows||[]);setAmazonProgress(data.percent||5,data.message||"Searching Amazon...",!data.done);status(`${data.message||"Searching Amazon..."} Found: ${data.found||0}; not found: ${data.issues||0}.`);if(data.done){if(!data.ok)throw new Error(data.message||"Amazon lookup failed.");download.dataset.jobId=jobId;download.style.display="inline-block";setAmazonProgress(100,"Finished. Download the Excel file.",false);break;}await new Promise(resolve=>setTimeout(resolve,1000));}}finally{button.disabled=false;}}
 document.getElementById("amazonFindBtn")?.addEventListener("click",()=>findAmazonUrls().catch(err=>{setAmazonProgress(100,"Failed.",false);status(err.message);}));
 document.getElementById("amazonDownloadBtn")?.addEventListener("click",event=>{const id=event.currentTarget.dataset.jobId;if(id)window.location.href=`/api/amazon-download?id=${encodeURIComponent(id)}`;});
+async function processVariacionet(){
+  const file=document.getElementById("variacionetFile")?.files[0];
+  if(!file){status("Zgjidh nje skedar Excel ose CSV.");return;}
+  const button=document.getElementById("variacionetBtn");
+  button.disabled=true;status("Duke perpunuar variacionet...");
+  try{
+    const form=new FormData();form.append("file",file);
+    const response=await fetch("/api/variacionet",{method:"POST",body:form});
+    if(!response.ok){const error=await response.json();throw new Error(error.error||"Perpunimi deshtoi.");}
+    const stats=JSON.parse(response.headers.get("X-Variacionet-Stats")||"{}");
+    const blob=await response.blob();
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement("a");link.href=url;link.download=file.name.replace(/\.(xlsx|xlsm|csv)$/i,"")+"_set_article."+file.name.split(".").pop().toLowerCase();
+    document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+    const info=`U plotesuan ${stats.filled||0} rreshta. ${stats.already_filled||0} ishin te plotesuar, ${stats.no_parent_count||0} pa artikull prind, ${stats.invalid_sku_count||0} me kod te pavlefshem, ${stats.duplicate_parents_count||0} prinder te dyfishuar.`;
+    status(info+" Shkarkimi filloi.");
+    const result=document.getElementById("variacionetResult");if(result)result.textContent=info;
+  }finally{button.disabled=false;}
+}
+document.getElementById("variacionetBtn")?.addEventListener("click",()=>processVariacionet().catch(err=>status(err.message)));
 async function calculateGewicht(){
   const input=document.getElementById("gewichtFile");
   const file=input?.files[0];
@@ -2152,6 +2185,9 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/find-url-amazon":
                 self.send_html(shell("Find URL Amazon", "amazon", AMAZON_PAGE))
                 return
+            if route == "/variacionet":
+                self.send_html(shell("Variacionet", "variacionet", VARIACIONET_PAGE))
+                return
             if route == "/gewicht":
                 self.send_html(shell("GEWICHT", "gewicht", GEWICHT_PAGE))
                 return
@@ -2290,7 +2326,7 @@ class Handler(BaseHTTPRequestHandler):
                 thread.start()
                 self.send_json({"job_id": job_id, "done": False})
                 return
-            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon"}:
+            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon", "/api/variacionet"}:
                 self.send_json({"error": "Not found"}, 404)
                 return
             content_type = self.headers.get("Content-Type", "")
@@ -2305,6 +2341,36 @@ class Handler(BaseHTTPRequestHandler):
                     "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
                 },
             )
+            if route == "/api/variacionet":
+                from variacionet import process_csv, process_xlsx
+
+                field = form["file"] if "file" in form else None
+                if field is None or not getattr(field, "filename", ""):
+                    raise ValueError("Choose an Excel or CSV file.")
+                original_name = safe_upload_filename(field.filename)
+                suffix = Path(original_name).suffix.lower()
+                if suffix not in {".xlsx", ".xlsm", ".csv"}:
+                    raise ValueError("Upload an .xlsx, .xlsm or .csv file.")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
+                    source_path = Path(temp.name)
+                    while chunk := field.file.read(1024 * 1024):
+                        temp.write(chunk)
+                output_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
+                        output_path = Path(temp.name)
+                    stats = (process_csv if suffix == ".csv" else process_xlsx)(str(source_path), str(output_path))
+                    summary = {key: stats.get(key, 0) for key in ("filled", "already_filled", "parent_rows")}
+                    for key in ("no_parent", "invalid_sku", "duplicate_parents"):
+                        summary[key + "_count"] = len(stats.get(key, []))
+                    content_type = {".csv": "text/csv", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12"}[suffix]
+                    self.send_download(output_path, f"{Path(original_name).stem}_set_article{suffix}", content_type,
+                                       {"X-Variacionet-Stats": json.dumps(summary), "Access-Control-Expose-Headers": "X-Variacionet-Stats"})
+                finally:
+                    source_path.unlink(missing_ok=True)
+                    if output_path is not None:
+                        output_path.unlink(missing_ok=True)
+                return
             if route == "/api/find-url-amazon":
                 from amazon_url_finder import read_asins
 

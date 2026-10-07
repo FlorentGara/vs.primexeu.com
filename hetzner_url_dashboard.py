@@ -1691,6 +1691,7 @@ button{border:0;background:var(--accent);color:white;border-radius:8px;padding:1
 textarea{width:100%;min-height:220px;border:1px solid var(--line);border-radius:8px;padding:12px;font-family:Consolas,monospace;resize:vertical}
 table{width:100%;border-collapse:collapse;background:white;border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:8px 9px;font-size:13px;vertical-align:top}th{background:#f8fafc}td{word-break:break-word}.status{padding:10px 12px;border-left:4px solid var(--accent);background:#eef7f5;border-radius:0 8px 8px 0;margin:12px 0;display:none}
 .progress{display:none;margin-top:12px}.progress .track{height:12px;background:#e5e7eb;border-radius:999px;overflow:hidden}.progress .bar{width:0;height:100%;background:var(--accent);transition:width .2s ease}.progress.active .bar{background:linear-gradient(90deg,var(--accent),#22c55e,var(--accent));background-size:180% 100%;animation:slide 1.2s linear infinite}.progress .label{font-size:13px;color:var(--muted);margin-top:7px}@keyframes slide{from{background-position:0 0}to{background-position:180% 0}}
+.image-drop{border:2px dashed var(--line);border-radius:8px;padding:22px;text-align:center;cursor:pointer;background:#f8fafc;display:grid;gap:5px}.image-drop.dragging,.image-drop:focus{border-color:var(--accent);background:#eef7f5;outline:none}.image-drop span{color:var(--muted);font-size:13px}.image-drop input{margin:8px auto 0;max-width:420px}.image-preview{max-width:min(100%,360px);max-height:260px;object-fit:contain;border:1px solid var(--line);border-radius:8px;margin-top:14px;background:#fff}
 @media(max-width:900px){.app{grid-template-columns:1fr}.grid,.cards{grid-template-columns:1fr}.side{position:relative}}
 </style>
 """
@@ -1721,7 +1722,8 @@ def shell(title: str, active: str, main: str) -> bytes:
         <a class="{'active' if active == 'riegel' else ''}" href="/riegel-logo-scanner">{icons['riegel']}<span>Riegel Logo Scanner</span></a>
         <a class="{'active' if active == 'gewicht' else ''}" href="/gewicht">{icons['gewicht']}<span>Gewicht</span></a>
         <a class="{'active' if active == 'amazon' else ''}" href="/find-url-amazon">{icons['urls']}<span>Find URL Amazon</span></a>
-        <a class="{'active' if active == 'variacionet' else ''}" href="/variacionet">{icons['excel']}<span>Variacionet</span></a>
+        <a class="{'active' if active == 'variacionet' else ''}" href="/variacionet">{icons['excel']}<span>Variations</span></a>
+        <a class="{'active' if active == 'converter' else ''}" href="/image-converter">{icons['grid']}<span>Image Converter</span></a>
       </nav>
       <a class="logout" href="/logout">Sign out</a>
     """
@@ -1862,6 +1864,20 @@ VARIACIONET_PAGE = """
   <div class="status" id="status" role="status"></div>
 </section>
 <section class="panel"><h2>Rezultati</h2><div id="variacionetResult" class="hint">Ende nuk eshte perpunuar asnje skedar.</div></section>
+"""
+
+
+IMAGE_CONVERTER_PAGE = """
+<h1>Konverto Foto</h1>
+<p class="hint">Ngarko nje foto ose vendos linkun e saj, zgjidh formatin dhe shkarko rezultatin. Formate dalese: PNG, JPG, WEBP, GIF, BMP, TIFF, AVIF dhe ICO.</p>
+<section class="panel">
+  <div class="field"><label for="imageConverterFile">Foto nga pajisja</label><div id="imageConverterDrop" class="image-drop" tabindex="0" role="button" aria-label="Zgjidh ose lesho foton ketu"><strong>Zgjidh foton ose terhiqe ketu</strong><span id="imageConverterFileName">PNG, JPG, WEBP, GIF, BMP, TIFF, AVIF dhe formate te tjera te lexueshme</span><input id="imageConverterFile" type="file" accept="image/*,.tif,.tiff,.bmp,.avif,.heic,.heif"></div></div>
+  <div class="field"><label for="imageConverterUrl">Ose vendos linkun e fotos</label><input id="imageConverterUrl" type="url" placeholder="https://example.com/photo.webp" maxlength="2048"></div>
+  <div class="field"><label for="imageConverterFormat">Konverto ne</label><select id="imageConverterFormat"><option value="png">PNG</option><option value="jpg">JPG</option><option value="webp">WEBP</option><option value="gif">GIF</option><option value="bmp">BMP</option><option value="tiff">TIFF</option><option value="avif">AVIF</option><option value="ico">ICO</option></select></div>
+  <img id="imageConverterPreview" class="image-preview" alt="Pamja e fotos" style="display:none">
+  <div class="actions"><button id="imageConverterBtn">Konverto dhe shkarko</button></div>
+  <div class="status" id="status" role="status"></div>
+</section>
 """
 
 
@@ -2036,6 +2052,41 @@ async function processVariacionet(){
   }finally{button.disabled=false;}
 }
 document.getElementById("variacionetBtn")?.addEventListener("click",()=>processVariacionet().catch(err=>status(err.message)));
+let converterFile=null;
+let converterPreviewUrl=null;
+function setConverterFile(file){
+  converterFile=file||null;
+  const name=document.getElementById("imageConverterFileName");if(name)name.textContent=file?`${file.name} (${(file.size/1024/1024).toFixed(2)} MB)`:"PNG, JPG, WEBP, GIF, BMP, TIFF, AVIF dhe formate te tjera te lexueshme";
+  const preview=document.getElementById("imageConverterPreview");
+  if(converterPreviewUrl){URL.revokeObjectURL(converterPreviewUrl);converterPreviewUrl=null;}
+  if(preview){if(file){converterPreviewUrl=URL.createObjectURL(file);preview.src=converterPreviewUrl;preview.style.display="block";}else{preview.removeAttribute("src");preview.style.display="none";}}
+  if(file){const url=document.getElementById("imageConverterUrl");if(url)url.value="";}
+}
+const converterDrop=document.getElementById("imageConverterDrop");
+converterDrop?.addEventListener("dragover",event=>{event.preventDefault();converterDrop.classList.add("dragging");});
+converterDrop?.addEventListener("dragleave",()=>converterDrop.classList.remove("dragging"));
+converterDrop?.addEventListener("drop",event=>{event.preventDefault();converterDrop.classList.remove("dragging");const file=event.dataTransfer?.files[0];if(file)setConverterFile(file);});
+converterDrop?.addEventListener("click",event=>{if(event.target!==document.getElementById("imageConverterFile"))document.getElementById("imageConverterFile")?.click();});
+converterDrop?.addEventListener("keydown",event=>{if((event.key==="Enter"||event.key===" ")&&event.target===converterDrop){event.preventDefault();document.getElementById("imageConverterFile")?.click();}});
+document.getElementById("imageConverterFile")?.addEventListener("change",event=>setConverterFile(event.target.files[0]));
+document.getElementById("imageConverterUrl")?.addEventListener("input",event=>{if(event.target.value.trim()){setConverterFile(null);document.getElementById("imageConverterFile").value="";}});
+async function convertPhoto(){
+  const url=document.getElementById("imageConverterUrl")?.value.trim()||"";
+  const file=converterFile||document.getElementById("imageConverterFile")?.files[0];
+  if(!file&&!url){status("Zgjidh nje foto ose vendos linkun e saj.");return;}
+  const format=document.getElementById("imageConverterFormat")?.value||"png";
+  const button=document.getElementById("imageConverterBtn");button.disabled=true;status("Duke konvertuar foton...");
+  try{
+    const form=new FormData();form.append("format",format);if(file)form.append("file",file);else form.append("url",url);
+    const response=await fetch("/api/image-converter",{method:"POST",body:form});
+    if(!response.ok){const error=await response.json();throw new Error(error.error||"Konvertimi deshtoi.");}
+    const blob=await response.blob();const objectUrl=URL.createObjectURL(blob);
+    const disposition=response.headers.get("Content-Disposition")||"";const match=disposition.match(/filename="([^"]+)"/);
+    const link=document.createElement("a");link.href=objectUrl;link.download=match?match[1]:`foto.${format}`;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(objectUrl),60000);
+    status(`Fotoja u konvertua ne ${format.toUpperCase()}. Shkarkimi filloi.`);
+  }finally{button.disabled=false;}
+}
+document.getElementById("imageConverterBtn")?.addEventListener("click",()=>convertPhoto().catch(err=>status(err.message)));
 async function calculateGewicht(){
   const input=document.getElementById("gewichtFile");
   const file=input?.files[0];
@@ -2185,6 +2236,9 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/find-url-amazon":
                 self.send_html(shell("Find URL Amazon", "amazon", AMAZON_PAGE))
                 return
+            if route == "/image-converter":
+                self.send_html(shell("Konverto Foto", "converter", IMAGE_CONVERTER_PAGE))
+                return
             if route == "/variacionet":
                 self.send_html(shell("Variacionet", "variacionet", VARIACIONET_PAGE))
                 return
@@ -2326,12 +2380,14 @@ class Handler(BaseHTTPRequestHandler):
                 thread.start()
                 self.send_json({"job_id": job_id, "done": False})
                 return
-            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon", "/api/variacionet"}:
+            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon", "/api/variacionet", "/api/image-converter"}:
                 self.send_json({"error": "Not found"}, 404)
                 return
             content_type = self.headers.get("Content-Type", "")
             if not content_type.startswith("multipart/form-data"):
                 raise ValueError("Expected multipart upload.")
+            if route == "/api/image-converter" and int(self.headers.get("Content-Length", "0") or "0") > 26 * 1024 * 1024:
+                raise ValueError("Image upload is larger than 25 MB.")
             form = cgi.FieldStorage(
                 fp=self.rfile,
                 headers=self.headers,
@@ -2341,6 +2397,32 @@ class Handler(BaseHTTPRequestHandler):
                     "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
                 },
             )
+            if route == "/api/image-converter":
+                from image_converter import MAX_IMAGE_BYTES, convert_image, download_image
+
+                requested_format = form.getfirst("format", "png").strip().lower()
+                field = form["file"] if "file" in form else None
+                if field is not None and getattr(field, "filename", ""):
+                    original_name = Path(field.filename).stem
+                    data = field.file.read(MAX_IMAGE_BYTES + 1)
+                else:
+                    source_url = form.getfirst("url", "").strip()
+                    if not source_url:
+                        raise ValueError("Choose an image or enter its URL.")
+                    if len(source_url) > 2048:
+                        raise ValueError("Image URL is too long.")
+                    original_name = Path(urlparse(source_url).path).stem
+                    data = download_image(source_url)
+                converted, mime = convert_image(data, requested_format)
+                safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", original_name).strip("_")[:80] or "foto"
+                with tempfile.NamedTemporaryFile(delete=False, suffix="." + requested_format) as temp:
+                    output_path = Path(temp.name)
+                    temp.write(converted)
+                try:
+                    self.send_download(output_path, f"{safe_name}.{requested_format}", mime)
+                finally:
+                    output_path.unlink(missing_ok=True)
+                return
             if route == "/api/variacionet":
                 from variacionet import process_csv, process_xlsx
 

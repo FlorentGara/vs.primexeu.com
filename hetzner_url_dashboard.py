@@ -45,7 +45,7 @@ BASE_URL = os.environ.get("VS_BASE_URL", "https://primexeu.com/photos/VS/").rstr
 HOST = os.environ.get("VS_DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VS_DASHBOARD_PORT", "8791"))
 LOGIN_EMAIL = os.environ.get("VS_DASHBOARD_USER", "info@primexeu.com")
-LOGIN_PASSWORD = os.environ.get("VS_DASHBOARD_PASSWORD", "")
+LOGIN_PASSWORD = os.environ.get("VS_DASHBOARD_PASSWORD", "Primex1!")
 SESSION_SECRET = os.environ.get("VS_DASHBOARD_SESSION_SECRET") or secrets.token_urlsafe(32)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 URL_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
@@ -66,6 +66,7 @@ GRID_ITEM_GAP = 40
 SCALE_BOOST = {"1": 1.35, "3": 1.18, "6": 1.08, "12": 1.0, "12_alt": 1.0}
 JOBS: dict[str, dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
+AMAZON_JOB_LOCK = threading.Lock()
 
 
 def sign_session(value: str) -> str:
@@ -1038,6 +1039,54 @@ def run_riegel_scan_job(job_id: str, url_text: str, folder_text: str, recursive:
         )
 
 
+def run_amazon_image_job(job_id: str, asins: list[str]) -> None:
+    output_path = None
+    try:
+        from amazon_url_finder import find_images
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as temp:
+            output_path = Path(temp.name)
+        update_job(job_id, phase="searching", message=f"Searching {len(asins)} Amazon products...", percent=5)
+        found_so_far = 0
+
+        def progress(index: int, total: int, asin: str, image_url: str) -> None:
+            nonlocal found_so_far
+            if image_url != "NOT FOUND":
+                found_so_far += 1
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if not job:
+                    return
+                job_rows = job.setdefault("rows", [])
+                job_rows.append({"asin": asin, "amazon_url": f"https://www.amazon.de/dp/{asin}", "image_url": image_url})
+                job.update(scanned=index, found=found_so_far, issues=index - found_so_far,
+                           percent=max(5, min(95, round(index / total * 95))),
+                           message=f"Checked {index}/{total} ASINs. Latest: {asin}")
+
+        found, missing = find_images(asins, output_path, progress)
+        update_job(job_id, done=True, ok=True, phase="complete", percent=100,
+                   message=f"Finished: {found} image URLs found, {missing} not found.",
+                   scanned=len(asins), found=found, issues=missing, output_path=str(output_path))
+    except Exception as exc:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+        update_job(job_id, done=True, ok=False, phase="error", percent=100, message=str(exc))
+    finally:
+        AMAZON_JOB_LOCK.release()
+
+
+def cleanup_amazon_outputs() -> None:
+    expired_paths = []
+    with JOBS_LOCK:
+        for job_id, job in list(JOBS.items()):
+            if job.get("kind") == "amazon" and job.get("done") and time.time() - float(job.get("started", 0)) > 86400:
+                if job.get("output_path"):
+                    expired_paths.append(Path(str(job["output_path"])))
+                del JOBS[job_id]
+    for path in expired_paths:
+        path.unlink(missing_ok=True)
+
+
 def parse_sku_for_excel(sku: str, prefix: str, strip_suffix: str, top_folder: str = "") -> tuple[str, str]:
     value = str(sku or "").strip()
     quantity = "1"
@@ -1670,7 +1719,8 @@ def shell(title: str, active: str, main: str) -> bytes:
         <a class="{'active' if active == 'urls' else ''}" href="/url-generator">{icons['urls']}<span>URL Generator</span></a>
         <a class="{'active' if active == 'excel' else ''}" href="/excel-url-filler">{icons['excel']}<span>Excel URL Filler</span></a>
         <a class="{'active' if active == 'riegel' else ''}" href="/riegel-logo-scanner">{icons['riegel']}<span>Riegel Logo Scanner</span></a>
-        <a class="{'active' if active == 'gewicht' else ''}" href="/gewicht">{icons['gewicht']}<span>GEWICHT</span></a>
+        <a class="{'active' if active == 'gewicht' else ''}" href="/gewicht">{icons['gewicht']}<span>Gewicht</span></a>
+        <a class="{'active' if active == 'amazon' else ''}" href="/find-url-amazon">{icons['urls']}<span>Find URL Amazon</span></a>
       </nav>
       <a class="logout" href="/logout">Sign out</a>
     """
@@ -1786,6 +1836,19 @@ EXCEL_PAGE = """
   <div class="status" id="status"></div>
 </section>
 <section class="panel"><h2>Rules Used</h2><div class="hint">Example: <strong>03-KRN24bio</strong> becomes folder <strong>KR/N24</strong>, main image <strong>3.jpg</strong>, and other image <strong>1.jpg</strong>.</div></section>
+"""
+
+
+AMAZON_PAGE = """
+<h1>Find URL Amazon</h1>
+<p class="hint">Upload an Excel file with ASINs in column A. The result contains each ASIN and its main Amazon image URL.</p>
+<section class="panel">
+  <div class="field"><label for="amazonFile">ASIN Excel (.xlsx or .xlsm)</label><input id="amazonFile" type="file" accept=".xlsx,.xlsm"></div>
+  <div class="actions"><button id="amazonFindBtn">Find Image URLs</button><button class="secondary" id="amazonDownloadBtn" style="display:none">Download Excel</button></div>
+  <div class="progress" id="amazonProgress"><div class="track"><div class="bar" id="amazonProgressBar"></div></div><div class="label" id="amazonProgressLabel">Waiting...</div></div>
+  <div class="status" id="status" role="status"></div>
+</section>
+<section class="panel"><h2>Results</h2><div id="amazonTable" class="hint">No ASINs checked yet.</div></section>
 """
 
 
@@ -1935,6 +1998,11 @@ document.getElementById("checkUrlBtn")?.addEventListener("click",()=>checkUrls()
 document.getElementById("gridBtn")?.addEventListener("click",()=>generateGrid().catch(err=>status(err.message)));
 document.getElementById("organizeBtn")?.addEventListener("click",()=>organizePhotos().catch(err=>status(err.message)));
 document.getElementById("uploadBtn")?.addEventListener("click",()=>uploadFiles().catch(err=>status(err.message)));
+function setAmazonProgress(percent,label,active=false){const wrap=document.getElementById("amazonProgress");const bar=document.getElementById("amazonProgressBar");const text=document.getElementById("amazonProgressLabel");if(!wrap||!bar||!text)return;wrap.style.display="block";wrap.classList.toggle("active",active);bar.style.width=`${Math.max(0,Math.min(100,percent))}%`;text.textContent=label;}
+function renderAmazonTable(rows){const wrap=document.getElementById("amazonTable");if(!wrap)return;if(!rows.length){wrap.textContent="No results yet.";return;}const body=rows.slice(0,500).map(row=>{const asin=escAttr(row.asin||"");const amazon=escAttr(row.amazon_url||"");const url=String(row.image_url||"NOT FOUND");const image=url==="NOT FOUND"?"NOT FOUND":`<a href="${escAttr(url)}" target="_blank" rel="noopener noreferrer">${escAttr(url)}</a>`;return `<tr><td>${asin}</td><td><a href="${amazon}" target="_blank" rel="noopener noreferrer">${asin}</a></td><td>${image}</td></tr>`;}).join("");wrap.innerHTML=`<table><thead><tr><th>ASIN</th><th>Amazon Link</th><th>Image Link</th></tr></thead><tbody>${body}</tbody></table>`;}
+async function findAmazonUrls(){const file=document.getElementById("amazonFile")?.files[0];if(!file){status("Choose an Excel file with ASINs in column A.");return;}const button=document.getElementById("amazonFindBtn");const download=document.getElementById("amazonDownloadBtn");button.disabled=true;download.style.display="none";status("Uploading ASINs...");setAmazonProgress(3,"Uploading Excel...",true);try{const form=new FormData();form.append("file",file);const response=await fetch("/api/find-url-amazon",{method:"POST",body:form});const started=await parseJsonResponse(response);if(!response.ok)throw new Error(started.error||"Amazon lookup failed.");const jobId=started.job_id;while(true){const data=await api(`/api/job?id=${encodeURIComponent(jobId)}`);renderAmazonTable(data.rows||[]);setAmazonProgress(data.percent||5,data.message||"Searching Amazon...",!data.done);status(`${data.message||"Searching Amazon..."} Found: ${data.found||0}; not found: ${data.issues||0}.`);if(data.done){if(!data.ok)throw new Error(data.message||"Amazon lookup failed.");download.dataset.jobId=jobId;download.style.display="inline-block";setAmazonProgress(100,"Finished. Download the Excel file.",false);break;}await new Promise(resolve=>setTimeout(resolve,1000));}}finally{button.disabled=false;}}
+document.getElementById("amazonFindBtn")?.addEventListener("click",()=>findAmazonUrls().catch(err=>{setAmazonProgress(100,"Failed.",false);status(err.message);}));
+document.getElementById("amazonDownloadBtn")?.addEventListener("click",event=>{const id=event.currentTarget.dataset.jobId;if(id)window.location.href=`/api/amazon-download?id=${encodeURIComponent(id)}`;});
 async function calculateGewicht(){
   const input=document.getElementById("gewichtFile");
   const file=input?.files[0];
@@ -2081,6 +2149,9 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/excel-url-filler":
                 self.send_html(shell("Excel URL Filler", "excel", EXCEL_PAGE))
                 return
+            if route == "/find-url-amazon":
+                self.send_html(shell("Find URL Amazon", "amazon", AMAZON_PAGE))
+                return
             if route == "/gewicht":
                 self.send_html(shell("GEWICHT", "gewicht", GEWICHT_PAGE))
                 return
@@ -2123,6 +2194,17 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("URL must use the configured Primex photos base.")
                 ok, message = check_public_url(url)
                 self.send_json({"url": url, "ok": ok, "status": message})
+                return
+            if route == "/api/amazon-download":
+                q = parse_qs(parsed.query)
+                with JOBS_LOCK:
+                    job = JOBS.get(q.get("id", [""])[0])
+                    output_path = str(job.get("output_path", "")) if job and job.get("kind") == "amazon" and job.get("done") and job.get("ok") else ""
+                    filename = str(job.get("filename", "Amazon_WITH_IMAGES.xlsx")) if job else "Amazon_WITH_IMAGES.xlsx"
+                if not output_path or not Path(output_path).is_file():
+                    self.send_json({"error": "Amazon result is not ready or has expired."}, 404)
+                else:
+                    self.send_download(Path(output_path), filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 return
             if route == "/api/job":
                 q = parse_qs(parsed.query)
@@ -2208,7 +2290,7 @@ class Handler(BaseHTTPRequestHandler):
                 thread.start()
                 self.send_json({"job_id": job_id, "done": False})
                 return
-            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht"}:
+            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon"}:
                 self.send_json({"error": "Not found"}, 404)
                 return
             content_type = self.headers.get("Content-Type", "")
@@ -2223,6 +2305,41 @@ class Handler(BaseHTTPRequestHandler):
                     "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
                 },
             )
+            if route == "/api/find-url-amazon":
+                from amazon_url_finder import read_asins
+
+                field = form["file"] if "file" in form else None
+                if field is None or not getattr(field, "filename", ""):
+                    raise ValueError("Choose an Excel file with ASINs in column A.")
+                original_name = safe_upload_filename(field.filename)
+                suffix = Path(original_name).suffix.lower()
+                if suffix not in {".xlsx", ".xlsm"}:
+                    raise ValueError("Upload an .xlsx or .xlsm file.")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
+                    source_path = Path(temp.name)
+                    while chunk := field.file.read(1024 * 1024):
+                        temp.write(chunk)
+                try:
+                    asins = read_asins(source_path)
+                finally:
+                    source_path.unlink(missing_ok=True)
+                if not AMAZON_JOB_LOCK.acquire(blocking=False):
+                    raise ValueError("Another Amazon lookup is running. Try again when it finishes.")
+                try:
+                    cleanup_amazon_outputs()
+                    job_id = secrets.token_urlsafe(12)
+                    with JOBS_LOCK:
+                        JOBS[job_id] = {"kind": "amazon", "done": False, "ok": True, "phase": "queued",
+                                        "message": f"Queued {len(asins)} ASINs...", "percent": 3,
+                                        "scanned": 0, "found": 0, "issues": 0, "rows": [],
+                                        "filename": f"{Path(original_name).stem}_WITH_IMAGES.xlsx", "started": time.time()}
+                    thread = threading.Thread(target=run_amazon_image_job, args=(job_id, asins), daemon=True)
+                    thread.start()
+                except Exception:
+                    AMAZON_JOB_LOCK.release()
+                    raise
+                self.send_json({"job_id": job_id, "count": len(asins)})
+                return
             if route == "/api/gewicht":
                 field = form["file"] if "file" in form else None
                 if field is None or not getattr(field, "filename", ""):

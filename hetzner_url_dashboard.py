@@ -1271,7 +1271,7 @@ def gewicht_excel_number(number: Decimal) -> int | float:
     return int(number) if number == number.to_integral_value() else float(number)
 
 
-def build_gewicht_workbook(source_file: Path, prefix: str = "AM", input_unit: str = "g", end_prefix: str = "") -> tuple[Path, int]:
+def build_gewicht_workbook(source_file: Path, prefix: str = "AM", input_unit: str = "g", code_suffix: str = "") -> tuple[Path, int]:
     try:
         from openpyxl import Workbook, load_workbook
         from openpyxl.styles import Font, PatternFill
@@ -1283,9 +1283,9 @@ def build_gewicht_workbook(source_file: Path, prefix: str = "AM", input_unit: st
     input_unit = input_unit.strip().lower()
     if input_unit not in {"g", "mg"}:
         raise ValueError("Choose g or mg for the uploaded weight.")
-    end_prefix = end_prefix.strip()
-    if end_prefix and not re.fullmatch(r"[A-Za-z0-9]+", end_prefix):
-        raise ValueError("The optional final code must contain only letters and numbers.")
+    code_suffix = code_suffix.strip()
+    if code_suffix and not re.fullmatch(r"[A-Za-z0-9]+", code_suffix):
+        raise ValueError("The optional code suffix must contain only letters and numbers.")
     source = load_workbook(source_file, read_only=True, data_only=True)
     try:
         sheet = source.active
@@ -1345,8 +1345,6 @@ def build_gewicht_workbook(source_file: Path, prefix: str = "AM", input_unit: st
         if has_conversion:
             headers.append("Gewicht (mg)")
         headers.extend(["Anzahl Flaschen", "Produktgewicht (mg)", "Karton (mg)", "GEWICHT (mg)"])
-        if end_prefix:
-            headers.append("Artikel Code (në fund)")
         result.append(headers)
         for cell in result[1]:
             cell.font = Font(bold=True, color="FFFFFF")
@@ -1358,14 +1356,12 @@ def build_gewicht_workbook(source_file: Path, prefix: str = "AM", input_unit: st
             product = milligrams * quantity if milligrams is not None else None
             total = product + carton if product is not None else None
             article_text = str(int(article)) if isinstance(article, float) and article.is_integer() else str(article).strip()
-            values = [article, f"{quantity:02d}-{prefix}{article_text}", weight]
+            values = [article, f"{quantity:02d}-{prefix}{article_text}{code_suffix}", weight]
             if has_conversion:
                 values.append(gewicht_excel_number(milligrams) if unit != "mg" and milligrams is not None else None)
             values.extend([quantity, gewicht_excel_number(product) if product is not None else None,
                            carton if milligrams is not None else None,
                            gewicht_excel_number(total) if total is not None else None])
-            if end_prefix:
-                values.append(f"{quantity:02d}-{end_prefix}{article_text}")
             result.append(values)
         for column in result.columns:
             result.column_dimensions[column[0].column_letter].width = max(18, min(28, len(str(column[0].value)) + 3))
@@ -1800,7 +1796,7 @@ GEWICHT_PAGE = """
   <div class="field"><label for="gewichtFile">Excel (.xlsx ose .xlsm)</label><input id="gewichtFile" type="file" accept=".xlsx,.xlsm"></div>
   <div class="field"><label for="gewichtPrefix">Prefiksi i kodit të artikullit</label><input id="gewichtPrefix" value="AM" placeholder="P.sh. AM" maxlength="20" required></div>
   <div class="field"><label for="gewichtUnit">Njësia e peshës në Excel</label><select id="gewichtUnit"><option value="g">Gramë (g) — kthe në mg</option><option value="mg">Miligramë (mg) — pa konvertim</option></select></div>
-  <div class="field full"><label for="gewichtEndPrefix">Prefiksi shtesë për kodin në kolonën e fundit (opsional)</label><input id="gewichtEndPrefix" placeholder="P.sh. KR; lëre bosh për të mos shtuar kolonë" maxlength="20"></div>
+  <div class="field full"><label for="gewichtCodeSuffix">Prapashtesë e kodit të artikullit (opsionale)</label><input id="gewichtCodeSuffix" placeholder="P.sh. BIO → 01-AM5657BIO; lëre bosh për kodin pa prapashtesë" maxlength="20"></div>
   <div class="actions"><button id="gewichtBtn">Llogarit dhe shkarko Excel</button></div>
   <div class="status" id="status" role="status"></div>
 </section>
@@ -1951,9 +1947,9 @@ async function calculateGewicht(){
     if(!/^[A-Za-z0-9]+$/.test(prefix||"")){throw new Error("Shkruaj një prefiks me shkronja ose numra.");}
     const form=new FormData();form.append("file",file);form.append("prefix",prefix);
     form.append("input_unit",document.getElementById("gewichtUnit")?.value||"g");
-    const endPrefix=document.getElementById("gewichtEndPrefix")?.value.trim()||"";
-    if(endPrefix&&!/^[A-Za-z0-9]+$/.test(endPrefix)){throw new Error("Prefiksi shtesë duhet të ketë vetëm shkronja ose numra.");}
-    form.append("end_prefix",endPrefix);
+    const codeSuffix=document.getElementById("gewichtCodeSuffix")?.value.trim()||"";
+    if(codeSuffix&&!/^[A-Za-z0-9]+$/.test(codeSuffix)){throw new Error("Prapashtesa duhet të ketë vetëm shkronja ose numra.");}
+    form.append("code_suffix",codeSuffix);
     const response=await fetch("/api/gewicht",{method:"POST",body:form});
     if(!response.ok){const error=await response.json();throw new Error(error.error||"Përpunimi dështoi.");}
     const blob=await response.blob();
@@ -2241,7 +2237,7 @@ class Handler(BaseHTTPRequestHandler):
                         temp.write(chunk)
                 output_path = None
                 try:
-                    output_path, count = build_gewicht_workbook(source_path, form.getfirst("prefix", "AM"), form.getfirst("input_unit", "g"), form.getfirst("end_prefix", ""))
+                    output_path, count = build_gewicht_workbook(source_path, form.getfirst("prefix", "AM"), form.getfirst("input_unit", "g"), form.getfirst("code_suffix", ""))
                     self.send_download(
                         output_path,
                         "GEWICHT.xlsx",

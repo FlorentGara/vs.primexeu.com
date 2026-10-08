@@ -1724,6 +1724,7 @@ def shell(title: str, active: str, main: str) -> bytes:
         <a class="{'active' if active == 'amazon' else ''}" href="/find-url-amazon">{icons['urls']}<span>Find URL Amazon</span></a>
         <a class="{'active' if active == 'variacionet' else ''}" href="/variacionet">{icons['excel']}<span>Variations</span></a>
         <a class="{'active' if active == 'converter' else ''}" href="/image-converter">{icons['grid']}<span>Image Converter</span></a>
+        <a class="{'active' if active == 'resizer' else ''}" href="/image-resizer">{icons['grid']}<span>Image Resizer</span></a>
       </nav>
       <a class="logout" href="/logout">Sign out</a>
     """
@@ -1881,6 +1882,20 @@ IMAGE_CONVERTER_PAGE = """
 </section>
 """
 
+
+IMAGE_RESIZER_PAGE = """
+<h1>Ndrysho Permasat e Fotos</h1>
+<p class="hint">Ngarko nje foto, zgjidh formatin e daljes dhe shkruaj permasat e reja ne piksele. Fotoja do te dale pikerisht me Width dhe Height qe shenon.</p>
+<section class="panel">
+  <div class="field"><label for="imageResizerFile">Foto nga pajisja</label><input id="imageResizerFile" type="file" accept="image/*,.tif,.tiff,.bmp,.avif,.heic,.heif"></div>
+  <div class="field"><label for="imageResizerFormat">Formati i daljes</label><select id="imageResizerFormat"><option value="png">PNG</option><option value="jpg">JPG</option><option value="webp">WEBP</option><option value="gif">GIF</option><option value="bmp">BMP</option><option value="tiff">TIFF</option><option value="avif">AVIF</option><option value="ico">ICO</option></select></div>
+  <div class="toolbar"><div class="field"><label for="imageResizerWidth">Width (px)</label><input id="imageResizerWidth" type="number" min="1" step="1" placeholder="P.sh. 1600" required></div><div class="field"><label for="imageResizerHeight">Height (px)</label><input id="imageResizerHeight" type="number" min="1" step="1" placeholder="P.sh. 1200" required></div></div>
+  <p class="hint">Nese ndryshon raporti Width/Height, fotoja shtrihet. ICO lejon maksimumi 256 x 256 px.</p>
+  <img id="imageResizerPreview" class="image-preview" alt="Pamja e fotos" style="display:none">
+  <div class="actions"><button id="imageResizerBtn">Ndrysho permasat dhe shkarko</button></div>
+  <div class="status" id="status" role="status"></div>
+</section>
+"""
 
 GEWICHT_PAGE = """
 <h1>GEWICHT</h1>
@@ -2090,6 +2105,33 @@ async function convertPhoto(){
   }finally{button.disabled=false;}
 }
 document.getElementById("imageConverterBtn")?.addEventListener("click",()=>convertPhoto().catch(err=>status(err.message)));
+document.getElementById("imageResizerFile")?.addEventListener("change",event=>{
+  const preview=document.getElementById("imageResizerPreview");
+  if(!preview)return;
+  if(preview.dataset.objectUrl)URL.revokeObjectURL(preview.dataset.objectUrl);
+  const file=event.target.files[0];
+  if(file){const url=URL.createObjectURL(file);preview.dataset.objectUrl=url;preview.src=url;preview.style.display="block";}
+  else{preview.removeAttribute("src");preview.style.display="none";delete preview.dataset.objectUrl;}
+});
+async function resizePhoto(){
+  const file=document.getElementById("imageResizerFile")?.files[0];
+  if(!file){status("Zgjidh nje foto.");return;}
+  const format=document.getElementById("imageResizerFormat")?.value||"png";
+  const width=document.getElementById("imageResizerWidth")?.value.trim()||"";
+  const height=document.getElementById("imageResizerHeight")?.value.trim()||"";
+  if(!/^\d+$/.test(width)||!/^\d+$/.test(height)||Number(width)<1||Number(height)<1||Number(width)*Number(height)>50000000){status("Shkruaj Width dhe Height si numra pozitive deri ne 50 milione piksela gjithsej.");return;}
+  const button=document.getElementById("imageResizerBtn");button.disabled=true;status("Duke ndryshuar permasat...");
+  try{
+    const form=new FormData();form.append("file",file);form.append("format",format);form.append("width",width);form.append("height",height);
+    const response=await fetch("/api/image-resizer",{method:"POST",body:form});
+    if(!response.ok){const error=await response.json();throw new Error(error.error||"Perpunimi deshtoi.");}
+    const blob=await response.blob();const objectUrl=URL.createObjectURL(blob);
+    const disposition=response.headers.get("Content-Disposition")||"";const match=disposition.match(/filename="([^"]+)"/);
+    const link=document.createElement("a");link.href=objectUrl;link.download=match?match[1]:`foto_${width}x${height}.${format}`;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(objectUrl),60000);
+    status(`Fotoja u ruajt si ${format.toUpperCase()} me permasa ${width} x ${height} px. Shkarkimi filloi.`);
+  }finally{button.disabled=false;}
+}
+document.getElementById("imageResizerBtn")?.addEventListener("click",()=>resizePhoto().catch(err=>status(err.message)));
 async function calculateGewicht(){
   const input=document.getElementById("gewichtFile");
   const file=input?.files[0];
@@ -2242,6 +2284,9 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/image-converter":
                 self.send_html(shell("Konverto Foto", "converter", IMAGE_CONVERTER_PAGE))
                 return
+            if route == "/image-resizer":
+                self.send_html(shell("Ndrysho Permasat e Fotos", "resizer", IMAGE_RESIZER_PAGE))
+                return
             if route == "/variacionet":
                 self.send_html(shell("Variacionet", "variacionet", VARIACIONET_PAGE))
                 return
@@ -2383,13 +2428,13 @@ class Handler(BaseHTTPRequestHandler):
                 thread.start()
                 self.send_json({"job_id": job_id, "done": False})
                 return
-            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon", "/api/variacionet", "/api/image-converter"}:
+            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon", "/api/variacionet", "/api/image-converter", "/api/image-resizer"}:
                 self.send_json({"error": "Not found"}, 404)
                 return
             content_type = self.headers.get("Content-Type", "")
             if not content_type.startswith("multipart/form-data"):
                 raise ValueError("Expected multipart upload.")
-            if route == "/api/image-converter" and int(self.headers.get("Content-Length", "0") or "0") > 26 * 1024 * 1024:
+            if route in {"/api/image-converter", "/api/image-resizer"} and int(self.headers.get("Content-Length", "0") or "0") > 26 * 1024 * 1024:
                 raise ValueError("Image upload is larger than 25 MB.")
             form = cgi.FieldStorage(
                 fp=self.rfile,
@@ -2423,6 +2468,30 @@ class Handler(BaseHTTPRequestHandler):
                     temp.write(converted)
                 try:
                     self.send_download(output_path, f"{safe_name}.{requested_format}", mime)
+                finally:
+                    output_path.unlink(missing_ok=True)
+                return
+            if route == "/api/image-resizer":
+                from image_converter import MAX_IMAGE_BYTES, convert_image
+
+                requested_format = form.getfirst("format", "png").strip().lower()
+                width_text = form.getfirst("width", "").strip()
+                height_text = form.getfirst("height", "").strip()
+                if not width_text or not height_text or not width_text.isascii() or not height_text.isascii() or not width_text.isdecimal() or not height_text.isdecimal() or len(width_text) > 8 or len(height_text) > 8:
+                    raise ValueError("Shkruaj Width dhe Height si numra pozitive ne piksela.")
+                width, height = int(width_text), int(height_text)
+                field = form["file"] if "file" in form else None
+                if field is None or not getattr(field, "filename", ""):
+                    raise ValueError("Zgjidh nje foto.")
+                original_name = Path(field.filename).stem
+                data = field.file.read(MAX_IMAGE_BYTES + 1)
+                converted, mime = convert_image(data, requested_format, width, height)
+                safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", original_name).strip("_")[:80] or "foto"
+                with tempfile.NamedTemporaryFile(delete=False, suffix="." + requested_format) as temp:
+                    output_path = Path(temp.name)
+                    temp.write(converted)
+                try:
+                    self.send_download(output_path, f"{safe_name}_{width}x{height}.{requested_format}", mime)
                 finally:
                     output_path.unlink(missing_ok=True)
                 return

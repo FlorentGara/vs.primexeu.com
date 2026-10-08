@@ -68,10 +68,17 @@ def download_image(url: str) -> bytes:
     raise ValueError("Linku ka shume ridrejtime.")
 
 
-def convert_image(data: bytes, output_format: str) -> tuple[bytes, str]:
+def convert_image(data: bytes, output_format: str, width: int | None = None, height: int | None = None) -> tuple[bytes, str]:
     output_format = output_format.lower()
     if output_format not in OUTPUT_FORMATS:
         raise ValueError("Zgjidh PNG, JPG, WEBP, GIF, BMP, TIFF, AVIF ose ICO.")
+    if (width is None) != (height is None):
+        raise ValueError("Shkruaj gjeresine dhe lartesine, ose leri te dyja bosh.")
+    if width is not None:
+        if not isinstance(width, int) or not isinstance(height, int) or width < 1 or height < 1 or width * height > MAX_IMAGE_PIXELS:
+            raise ValueError("Permasat duhet te jene numra pozitive deri ne 50 milione piksela gjithsej.")
+        if output_format == "ico" and (width > 256 or height > 256):
+            raise ValueError("Formati ICO pranon permasa deri ne 256 x 256 piksela.")
     if not data or len(data) > MAX_IMAGE_BYTES:
         raise ValueError("Fotoja duhet te jete deri ne 25 MB.")
     try:
@@ -81,6 +88,8 @@ def convert_image(data: bytes, output_format: str) -> tuple[bytes, str]:
             source.seek(0)
             image = ImageOps.exif_transpose(source)
             image.load()
+            if width is not None:
+                image = image.resize((width, height), Image.Resampling.LANCZOS)
             result = io.BytesIO()
             name, mime = OUTPUT_FORMATS[output_format]
             if output_format in {"jpg", "bmp"}:
@@ -97,7 +106,9 @@ def convert_image(data: bytes, output_format: str) -> tuple[bytes, str]:
             elif image.mode not in {"RGB", "RGBA", "L", "LA"}:
                 image = image.convert("RGBA")
             options = {"quality": 92, "optimize": True} if output_format == "jpg" else {}
-            if output_format == "avif":
+            if output_format == "ico" and width is not None:
+                options = {"sizes": [image.size]}
+            elif output_format == "avif":
                 options = {"quality": 85}
             elif output_format == "webp":
                 options = {"quality": 90, "method": 4}

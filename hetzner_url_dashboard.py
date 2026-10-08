@@ -1859,6 +1859,7 @@ VARIACIONET_PAGE = """
 <h1>Variacionet</h1>
 <p class="hint">Ngarko Excel ose CSV me kolonat <strong>druck_pseudonym</strong>, <strong>lager_nr</strong> dhe <strong>set_article</strong>. Programi ploteson set_article per variacionet duke perdorur lager_nr te artikullit me nje shishe. Vlerat ekzistuese ruhen.</p>
 <section class="panel">
+  <div class="field"><label for="variacionetAccount">Per cilen llogari?</label><select id="variacionetAccount" required><option value="">Zgjidh Visando ose Versanel</option><option value="visando">Visando</option><option value="versanel">Versanel</option></select></div>
   <div class="field"><label for="variacionetFile">Excel ose CSV (.xlsx, .xlsm, .csv)</label><input id="variacionetFile" type="file" accept=".xlsx,.xlsm,.csv"></div>
   <div class="actions"><button id="variacionetBtn">Ploteso variacionet dhe shkarko</button></div>
   <div class="status" id="status" role="status"></div>
@@ -2035,10 +2036,12 @@ document.getElementById("amazonDownloadBtn")?.addEventListener("click",event=>{c
 async function processVariacionet(){
   const file=document.getElementById("variacionetFile")?.files[0];
   if(!file){status("Zgjidh nje skedar Excel ose CSV.");return;}
+  const account=document.getElementById("variacionetAccount")?.value;
+  if(!account){status("Zgjidh Visando ose Versanel para perpunimit.");return;}
   const button=document.getElementById("variacionetBtn");
   button.disabled=true;status("Duke perpunuar variacionet...");
   try{
-    const form=new FormData();form.append("file",file);
+    const form=new FormData();form.append("file",file);form.append("account",account);
     const response=await fetch("/api/variacionet",{method:"POST",body:form});
     if(!response.ok){const error=await response.json();throw new Error(error.error||"Perpunimi deshtoi.");}
     const stats=JSON.parse(response.headers.get("X-Variacionet-Stats")||"{}");
@@ -2424,8 +2427,10 @@ class Handler(BaseHTTPRequestHandler):
                     output_path.unlink(missing_ok=True)
                 return
             if route == "/api/variacionet":
-                from variacionet import process_csv, process_xlsx
+                from variacionet import account_id_for, process_csv, process_xlsx
 
+                account = form.getfirst("account", "").strip().lower()
+                account_id_for(account)
                 field = form["file"] if "file" in form else None
                 if field is None or not getattr(field, "filename", ""):
                     raise ValueError("Choose an Excel or CSV file.")
@@ -2441,7 +2446,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
                         output_path = Path(temp.name)
-                    stats = (process_csv if suffix == ".csv" else process_xlsx)(str(source_path), str(output_path))
+                    stats = (process_csv if suffix == ".csv" else process_xlsx)(str(source_path), str(output_path), account=account)
                     summary = {key: stats.get(key, 0) for key in ("filled", "already_filled", "parent_rows")}
                     for key in ("no_parent", "invalid_sku", "duplicate_parents"):
                         summary[key + "_count"] = len(stats.get(key, []))

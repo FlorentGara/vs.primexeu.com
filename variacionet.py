@@ -5,6 +5,26 @@ import re
 from openpyxl import load_workbook
 
 
+ACCOUNT_IDS = {"visando": 24765, "versanel": 8942}
+
+
+def account_id_for(account):
+    try:
+        return ACCOUNT_IDS[account.lower()]
+    except (AttributeError, KeyError):
+        raise ValueError("Zgjidh Visando ose Versanel para perpunimit.") from None
+
+
+def ensure_xlsx_columns(ws):
+    columns = {normalize_header(ws.cell(1, col).value): col for col in range(1, ws.max_column + 1)}
+    for name in ("amazon_mengen_abgleich", "amazon_mengen_abgleich_account_id", "amazon_mengen_abgleich_max"):
+        if name not in columns:
+            col = ws.max_column + 1
+            ws.cell(1, col).value = name
+            columns[name] = col
+    return columns
+
+
 def clean_text(value):
     if value is None:
         return ""
@@ -44,19 +64,6 @@ def parse_sku(sku):
             return base.upper(), qty
 
     return None, None
-def get_quantity(sku):
-    sku = clean_text(sku)
-
-    m = re.match(r"^(\d+)-", sku)
-    if m:
-        return int(m.group(1))
-
-    m = re.search(r"-(\d+)$", sku)
-    if m:
-        return int(m.group(1))
-
-    return None
-
 def find_columns(headers):
     normalized = {normalize_header(value): index for index, value in enumerate(headers, start=1)}
 
@@ -78,7 +85,8 @@ def find_columns(headers):
     )
 
 
-def process_xlsx(input_path, output_path, sheet_name=None):
+def process_xlsx(input_path, output_path, sheet_name=None, account=None):
+    account_id = account_id_for(account)
     keep_vba = input_path.lower().endswith(".xlsm")
     wb = load_workbook(input_path, keep_vba=keep_vba)
 
@@ -89,6 +97,7 @@ def process_xlsx(input_path, output_path, sheet_name=None):
 
     headers = [ws.cell(1, col).value for col in range(1, max(ws.max_column, 3) + 1)]
     sku_col, lager_col, set_col = find_columns(headers)
+    amazon_cols = ensure_xlsx_columns(ws)
 
     parents = {}
     duplicate_parents = []
@@ -115,8 +124,15 @@ def process_xlsx(input_path, output_path, sheet_name=None):
     no_parent = []
     invalid_sku = []
 
-    # Second pass: fill only blank set_article cells.
+    # Second pass: fill Amazon fields and only blank set_article cells.
     for row in range(2, ws.max_row + 1):
+        if all(ws.cell(row, col).value is None for col in range(1, ws.max_column + 1)):
+            continue
+        ws.cell(row, amazon_cols["amazon_mengen_abgleich"]).value = 1
+        ws.cell(row, amazon_cols["amazon_mengen_abgleich_account_id"]).value = account_id
+        max_cell = ws.cell(row, amazon_cols["amazon_mengen_abgleich_max"])
+        if not clean_text(max_cell.value):
+            max_cell.value = 12 if parsed_rows[row][1] == 1 else 4
         current_set = clean_text(ws.cell(row, set_col).value)
         if current_set:
             already_filled += 1
@@ -179,7 +195,8 @@ def detect_csv_dialect(path, encoding):
         return csv.excel
 
 
-def process_csv(input_path, output_path):
+def process_csv(input_path, output_path, account=None):
+    account_id = account_id_for(account)
     encoding = detect_csv_encoding(input_path)
     dialect = detect_csv_dialect(input_path, encoding)
 
@@ -195,8 +212,13 @@ def process_csv(input_path, output_path):
 
     sku_col, lager_col, set_col = find_columns(headers)
     sku_idx, lager_idx, set_idx = sku_col - 1, lager_col - 1, set_col - 1
+    columns = {normalize_header(value): index for index, value in enumerate(headers)}
+    for name in ("amazon_mengen_abgleich", "amazon_mengen_abgleich_account_id", "amazon_mengen_abgleich_max"):
+        if name not in columns:
+            columns[name] = len(headers)
+            headers.append(name)
 
-    max_idx = max(sku_idx, lager_idx, set_idx)
+    max_idx = max(sku_idx, lager_idx, set_idx, *columns.values())
     for row in rows:
         while len(row) <= max_idx:
             row.append("")
@@ -226,6 +248,13 @@ def process_csv(input_path, output_path):
     invalid_sku = []
 
     for index, row in enumerate(rows[1:], start=2):
+        if not any(clean_text(value) for value in row):
+            continue
+        row[columns["amazon_mengen_abgleich"]] = "1"
+        row[columns["amazon_mengen_abgleich_account_id"]] = str(account_id)
+        max_column = columns["amazon_mengen_abgleich_max"]
+        if not clean_text(row[max_column]):
+            row[max_column] = "12" if parsed_rows[index][1] == 1 else "4"
 
         if clean_text(row[set_idx]):
             already_filled += 1
@@ -235,20 +264,6 @@ def process_csv(input_path, output_path):
         base, qty = parsed_rows[index]
 
         # Plotëso kolonën H
-        qty_h = get_quantity(sku)
-
-        while len(row) <= 7:
-            row.append("")
-
-        current_value = str(row[7]).strip()
-
-        if current_value not in ("12", "4"):
-            if current_value == "" or current_value == "0":
-                if qty_h == 1:
-                    row[7] = "12"
-                elif qty_h is not None:
-                    row[7] = "4"
-
         if not sku:
             continue
 

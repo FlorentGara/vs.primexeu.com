@@ -20,7 +20,10 @@ from openpyxl import Workbook, load_workbook
 
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-DATA_DIR = Path(os.environ.get("VS_DATABASE_DATA_DIR", Path(__file__).parent / "database_project_data"))
+DATA_DIR = Path(os.environ.get(
+    "VS_DATABASE_DATA_DIR",
+    Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "vs-database-project",
+))
 TABLE_FILES = {
     "active": "active_products.xlsx",
     "dreamrobot": "dreamrobot_products.xlsx",

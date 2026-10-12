@@ -1706,6 +1706,7 @@ def shell(title: str, active: str, main: str) -> bytes:
         "excel": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"></path><path d="M14 2v6h6"></path><path d="M8 13h8"></path><path d="M8 17h5"></path></svg>',
         "riegel": '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path><path d="M8 11h6"></path><path d="M11 8v6"></path></svg>',
         "gewicht": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16"></path><path d="M6 20 9 8h6l3 12"></path><circle cx="12" cy="5" r="2"></circle></svg>',
+        "database": '<svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"></ellipse><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"></path></svg>',
     }
     nav = f"""
       <div class="brand-wrap">
@@ -1725,6 +1726,7 @@ def shell(title: str, active: str, main: str) -> bytes:
         <a class="{'active' if active == 'variacionet' else ''}" href="/variacionet">{icons['excel']}<span>Variations</span></a>
         <a class="{'active' if active == 'converter' else ''}" href="/image-converter">{icons['grid']}<span>Image Converter</span></a>
         <a class="{'active' if active == 'resizer' else ''}" href="/image-resizer">{icons['grid']}<span>Image Resizer</span></a>
+        <a class="{'active' if active == 'database' else ''}" href="/database-project">{icons['database']}<span>Database Project</span></a>
       </nav>
       <a class="logout" href="/logout">Sign out</a>
     """
@@ -2223,7 +2225,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_asset(self, filename: str) -> bool:
         safe_name = Path(filename).name
-        if safe_name not in {"logo-vs.png", "logoprimexeu.png"}:
+        if safe_name not in {"logo-vs.png", "logoprimexeu.png", "cmimetVisando.png"}:
             return False
         path = ASSET_ROOT / safe_name
         if not path.exists() or not path.is_file():
@@ -2295,6 +2297,23 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if route == "/riegel-logo-scanner":
                 self.send_html(shell("Riegel Logo Scanner", "riegel", RIEGEL_PAGE))
+                return
+            if route == "/database-project":
+                from database_project import PAGE
+                self.send_html(shell("Database Project", "database", PAGE))
+                return
+            if route == "/api/database/status":
+                from database_project import table_status
+                self.send_json(table_status())
+                return
+            if route in {"/api/database/active-products", "/api/database/calculated-prices"}:
+                from database_project import XLSX_MIME, active_products_report, database_prices_report
+                path, _ = active_products_report() if route.endswith("active-products") else database_prices_report()
+                name = ("PRODUKTET AKTIVE VS AMAZON_" if route.endswith("active-products") else "VS_DATABASE_CALC_") + time.strftime("%d.%m.%Y") + ".xlsx"
+                try:
+                    self.send_download(path, name, XLSX_MIME)
+                finally:
+                    path.unlink(missing_ok=True)
                 return
             if route == "/api/top-folders":
                 self.send_json({"root": str(VS_ROOT), "baseUrl": BASE_URL, "folders": list_top_folders()})
@@ -2428,7 +2447,7 @@ class Handler(BaseHTTPRequestHandler):
                 thread.start()
                 self.send_json({"job_id": job_id, "done": False})
                 return
-            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon", "/api/variacionet", "/api/image-converter", "/api/image-resizer"}:
+            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon", "/api/variacionet", "/api/image-converter", "/api/image-resizer", "/api/database/pricing", "/api/database/sku", "/api/database/import"}:
                 self.send_json({"error": "Not found"}, 404)
                 return
             content_type = self.headers.get("Content-Type", "")
@@ -2445,6 +2464,31 @@ class Handler(BaseHTTPRequestHandler):
                     "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
                 },
             )
+            if route.startswith("/api/database/"):
+                from database_project import XLSX_MIME, import_table, pricing_report, sku_report
+                field = form["file"] if "file" in form else None
+                if field is None or not getattr(field, "filename", ""):
+                    raise ValueError("Choose an Excel or CSV file.")
+                filename = safe_upload_filename(field.filename)
+                data = field.file.read(26 * 1024 * 1024)
+                if len(data) > 25 * 1024 * 1024:
+                    raise ValueError("The uploaded file is larger than 25 MB.")
+                if route == "/api/database/import":
+                    count = import_table(form.getfirst("kind", ""), data, filename)
+                    self.send_json({"rows": count})
+                    return
+                if route == "/api/database/pricing":
+                    pricing_type = form.getfirst("pricing_type", "")
+                    path, _ = pricing_report(data, filename, pricing_type)
+                    name = f"CALCULATED_PRICES_{pricing_type.upper()}_{time.strftime('%d.%m.%Y_%H.%M')}.xlsx"
+                else:
+                    path, _ = sku_report(data, filename)
+                    name = f"Processed_Visando_SKUs_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+                try:
+                    self.send_download(path, name, XLSX_MIME)
+                finally:
+                    path.unlink(missing_ok=True)
+                return
             if route == "/api/image-converter":
                 from image_converter import MAX_IMAGE_BYTES, convert_image, download_image
 

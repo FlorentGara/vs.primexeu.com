@@ -17,6 +17,7 @@ python-runtime/
 
 # Generated output
 outputs/
+database_project_data/
 
 # IDE and OS files
 .vscode/

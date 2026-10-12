@@ -272,33 +272,34 @@ def database_prices_report() -> tuple[Path, int]:
 PAGE = r'''
 <h1>VS Database Project</h1>
 <p class="hint">Calculate product prices and generate the same Excel reports as the VS Database project.</p>
-<div class="db-actions">
-  <button id="dbActive" class="db-green">PRODUKTET AKTIVE TE VS NE AMAZON</button>
-  <button id="dbPrices" class="secondary">CALCULATE PRICES FROM DATABASE</button>
-</div>
-<div id="dbStatus" class="status" role="status"></div>
-<div class="db-columns">
-  <section class="panel"><h2>Calculate Pricing for One Product</h2>
+<section class="panel db-panel"><h2>Database Reports</h2>
+  <div class="actions">
+    <button id="dbActive">PRODUKTET AKTIVE TE VS NE AMAZON</button>
+    <button id="dbPrices" class="secondary">CALCULATE PRICES FROM DATABASE</button>
+  </div>
+  <div id="dbStatus" class="status" role="status"></div>
+</section>
+<section class="panel db-panel"><h2>Calculate Pricing for One Product</h2>
     <div class="db-inputs"><div class="field"><label for="dbEk">Enter EK1er Price</label><input id="dbEk" type="number" min="0" step="0.01" value="6.3"></div>
     <fieldset><legend>Pricing Type</legend><label><input type="radio" name="dbType" value="normal" checked> Normal</label><label><input type="radio" name="dbType" value="feinkost"> Feinkost</label></fieldset></div>
     <div class="db-table"><table><thead><tr><th>Amazon</th><th>12er</th><th>6er</th><th>3er</th><th>4er</th><th>2er</th><th>1er</th></tr></thead><tbody id="dbManual"></tbody></table></div>
-  </section>
-  <section class="panel"><h2>Excel Format Example</h2><p class="hint">Columns: <strong>Produkt, EK1er</strong>. An optional third column, <strong>Spalte</strong> (W/F), controls Normal pricing. Other values use W.</p>
+</section>
+<section class="panel db-panel"><h2>Excel Format Example</h2><p class="hint">Columns: <strong>Produkt, EK1er</strong>. An optional third column, <strong>Spalte</strong> (W/F), controls Normal pricing. Other values use W.</p>
     <img class="db-example" src="/assets/cmimetVisando.png" alt="Excel example with Produkt and EK1er columns">
     <div class="field"><label for="dbExcel">Upload Excel File</label><input id="dbExcel" type="file" accept=".xlsx,.xlsm,.xls,.csv"></div>
-    <div class="db-actions"><button id="dbNormal" class="secondary">Generate Normal Pricing</button><button id="dbFeinkost" class="db-cyan">Generate Feinkost Pricing</button></div>
-  </section>
-</div>
-<section class="panel"><h2>Process Visando SKU File</h2><p class="hint">Upload CSV or Excel with <code>a_seller_sku</code> in the first column. The report marks SKUs without letters and SKUs ending in a hyphen and two digits.</p>
-  <div class="field"><label for="dbSkuFile">Upload Visando SKU File</label><input id="dbSkuFile" type="file" accept=".csv,.txt,.xlsx,.xlsm,.xls"></div>
-  <div class="actions"><button id="dbSku" class="db-green">Generate Processed SKU Report</button></div>
+    <div class="actions"><button id="dbNormal">Generate Normal Pricing</button><button id="dbFeinkost" class="secondary">Generate Feinkost Pricing</button></div>
 </section>
-<section class="panel"><h2>Database source files</h2><p class="hint">Import exports of the original “PRODUKTET AKTIVE NE AMAZON” and “EXPORTI I PRODUKTEVE NGA DREAMROBOT” tables to generate the two database reports above. Files stay in the site's private data folder.</p>
+<section class="panel db-panel"><h2>Process Visando SKU File</h2><p class="hint">Upload CSV or Excel with <code>a_seller_sku</code> in the first column. The report marks SKUs without letters and SKUs ending in a hyphen and two digits.</p>
+  <div class="field"><label for="dbSkuFile">Upload Visando SKU File</label><input id="dbSkuFile" type="file" accept=".csv,.txt,.xlsx,.xlsm,.xls"></div>
+  <div class="actions"><button id="dbSku">Generate Processed SKU Report</button></div>
+</section>
+<section class="panel db-panel"><h2>Database source files</h2><p class="hint">Import exports of the original “PRODUKTET AKTIVE NE AMAZON” and “EXPORTI I PRODUKTEVE NGA DREAMROBOT” tables to generate the two database reports above. Files stay in the site's private data folder.</p>
   <div class="db-imports"><div class="field"><label for="dbActiveFile">Active products table</label><input id="dbActiveFile" type="file" accept=".xlsx,.xlsm,.xls,.csv"><button id="dbImportActive" class="mutedbtn">Import active products</button><small id="dbActiveState"></small></div>
   <div class="field"><label for="dbDreamFile">Dreamrobot products table</label><input id="dbDreamFile" type="file" accept=".xlsx,.xlsm,.xls,.csv"><button id="dbImportDream" class="mutedbtn">Import Dreamrobot products</button><small id="dbDreamState"></small></div></div>
 </section>
 <style>
-.db-actions{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0 24px}.db-green{background:#16bf87}.db-cyan{background:#16afbf}.db-columns{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:88px}.db-columns h2,.panel h2{font-size:21px;font-weight:500;color:#4b66db;margin:0 0 22px}.db-inputs{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-bottom:18px}.db-inputs fieldset{border:0;padding:0;margin:0}.db-inputs legend{font-size:13px;font-weight:750;margin-bottom:11px}.db-inputs fieldset label{font-weight:400;margin-right:12px}.db-inputs input[type=radio]{width:auto}.db-table{overflow:auto}.db-table th,.db-table td{text-align:center;min-width:75px}.db-table tbody tr:nth-child(odd){background:#f4f4f4}.db-table tbody th{white-space:nowrap}.db-example{max-width:100%;width:348px;height:auto;display:block;border:1px solid var(--line);border-radius:6px;margin:12px 0 24px}.db-imports{display:grid;grid-template-columns:1fr 1fr;gap:20px}.db-imports .field button{justify-self:start}.db-imports small{color:var(--muted)}@media(max-width:1100px){.db-columns{grid-template-columns:1fr;margin-top:32px}}@media(max-width:650px){.db-inputs,.db-imports{grid-template-columns:1fr}}
+main,.db-panel{min-width:0}
+.db-panel h2{margin:0 0 12px}.db-panel .actions{margin-top:16px}.db-inputs{display:grid;grid-template-columns:minmax(0,280px) minmax(0,1fr);gap:20px;align-items:end;margin:18px 0}.db-inputs fieldset{border:0;padding:0;margin:0}.db-inputs legend{font-size:13px;font-weight:750;margin-bottom:11px}.db-inputs fieldset label{font-weight:400;margin-right:12px;white-space:nowrap}.db-inputs input[type=radio]{width:auto}.db-table{overflow-x:auto}.db-table table{min-width:670px}.db-table th,.db-table td{text-align:center;white-space:nowrap}.db-example{max-width:100%;width:348px;height:auto;display:block;border:1px solid var(--line);border-radius:6px;margin:12px 0 24px}.db-imports{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.db-imports .field button{justify-self:start}.db-imports small{color:var(--muted)}.db-panel button:focus-visible,.db-panel input:focus-visible{outline:2px solid var(--blue);outline-offset:2px}@media(max-width:650px){.db-inputs,.db-imports{grid-template-columns:1fr}.db-panel button{max-width:100%;white-space:normal}}
 </style>
 <script>
 const dbPacks=[['12er',12,4.33,2.84],['6er',6,4.33,1.55],['3er',3,4.33,.85],['4er',4,4.33,1.55],['2er',2,3.60,.68],['1er',1,3.60,.42]];

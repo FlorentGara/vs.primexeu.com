@@ -229,7 +229,7 @@ def database_prices_report() -> tuple[Path, int]:
     active_spalte = _column(active[0], "spalte1")
     dream_sku = _column(dreamrobot[0], "a_seller_sku")
     dream_ek = _column(dreamrobot[0], "ek_preis")
-    dream_vk = _column(dreamrobot[0], "vk_preis")
+    _column(dreamrobot[0], "vk_preis")  # Kept for parity with the source query; pricing does not use it.
     products: dict[str, list[list[object]]] = {}
     for row in active[1:]:
         if len(row) > active_sku:
@@ -239,7 +239,7 @@ def database_prices_report() -> tuple[Path, int]:
     sheet.append(["Parent SKU", "Children SKU", "Label", "Wein/Feinkost", "Price Category", "Parent EK1er", "Children EKXer", "Faktor", "VK Children Final", "Transport Adjustment"])
     count = 0
     for row in dreamrobot[1:]:
-        if len(row) <= max(dream_sku, dream_ek, dream_vk):
+        if len(row) <= max(dream_sku, dream_ek):
             continue
         sku = str(row[dream_sku] or "")
         if not sku.startswith("01-") or sku not in products:
@@ -251,8 +251,8 @@ def database_prices_report() -> tuple[Path, int]:
         if ek1er == 0:
             continue
         for product in products[sku]:
-            spalte = str(product[active_spalte] or "").strip().upper()
-            shipping = str(product[active_shipping] or "").strip().lower()
+            spalte = str((product[active_spalte] if len(product) > active_spalte else None) or "").strip().upper()
+            shipping = str((product[active_shipping] if len(product) > active_shipping else None) or "").strip().lower()
             for label in BATCH_LABELS:
                 result = calculate_pack(ek1er, label, "normal", spalte, database=True)
                 raw = result["raw"]

@@ -188,6 +188,44 @@ def authenticate(username: str, password: str, code: str = "") -> dict[str, Any]
     return {key: value for key, value in user.items() if key not in {"password_hash", "totp_secret", "totp_pending"}}
 
 
+def authenticate_password(username: str, password: str) -> dict[str, Any] | None:
+    user = get_user(username)
+    if not user or not user["active"] or not _verify_password(str(password or ""), user["password_hash"]):
+        return None
+    return {key: value for key, value in user.items() if key not in {"password_hash", "totp_secret", "totp_pending"}}
+
+
+def create_login_challenge(username: str) -> str:
+    user = get_user(username)
+    if not user or not user["active"] or not user["totp_enabled"]:
+        raise ValueError("A two-factor login challenge is not available.")
+    payload = f"{user['username']}|{user['session_version']}|{int(time.time())}|{secrets.token_urlsafe(18)}"
+    return f"{payload}|{_session_signature('login:' + payload)}"
+
+
+def complete_login_challenge(challenge: str, code: str) -> dict[str, Any] | None:
+    parts = str(challenge or "").split("|")
+    if len(parts) != 5:
+        return None
+    username, version_text, timestamp_text, nonce, signature = parts
+    payload = "|".join(parts[:4])
+    if not nonce or not hmac.compare_digest(signature, _session_signature("login:" + payload)):
+        return None
+    try:
+        version, timestamp = int(version_text), int(timestamp_text)
+    except ValueError:
+        return None
+    now = int(time.time())
+    if timestamp > now + 30 or now - timestamp > 300:
+        return None
+    user = get_user(username)
+    if not user or not user["active"] or user["session_version"] != version or not user["totp_enabled"]:
+        return None
+    if not _verify_totp(str(user["totp_secret"]), code):
+        return None
+    return {key: value for key, value in user.items() if key not in {"password_hash", "totp_secret", "totp_pending"}}
+
+
 def session_user(cookie_value: str) -> dict[str, Any] | None:
     parts = str(cookie_value or "").split("|")
     if len(parts) != 5:

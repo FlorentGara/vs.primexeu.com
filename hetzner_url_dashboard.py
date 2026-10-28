@@ -1793,10 +1793,10 @@ LOGIN_PAGE = """
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VS Tools Login</title><link rel="icon" type="image/png" href="/assets/logoprimexeu.png">__STYLE__</head>
 <body><div class="login-page"><form class="login-card" method="post" action="/login">
   <img class="login-logo" src="/assets/logoprimexeu.png" alt="Primex EU">
-  <div class="field"><label for="loginUsername">Email or username</label><input id="loginUsername" name="username" type="text" autocomplete="username" required></div>
-  <div class="field"><label for="loginPassword">Password</label><input id="loginPassword" name="password" type="password" autocomplete="current-password" required></div>
-  <div class="field"><label for="loginCode">Authenticator code <span class="hint">(only if 2FA is enabled)</span></label><input id="loginCode" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,8}" maxlength="8"></div>
-  <button type="submit">Sign in</button>
+  <input type="hidden" name="stage" value="__LOGIN_STAGE__"><div id="loginCredentials" style="display:__CREDENTIALS_DISPLAY__"><div class="field"><label for="loginUsername">Email or username</label><input id="loginUsername" name="username" type="text" autocomplete="username" value="__LOGIN_USERNAME__" __CREDENTIALS_STATE__></div>
+  <div class="field"><label for="loginPassword">Password</label><input id="loginPassword" name="password" type="password" autocomplete="current-password" __CREDENTIALS_STATE__></div></div>__HIDDEN_USERNAME__
+  <p class="hint" style="display:__TOTP_PROMPT_DISPLAY__">Enter the six-digit code from your authenticator app.</p><div class="field" style="display:__CODE_DISPLAY__"><label for="loginCode">Authenticator code</label><input id="loginCode" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6}" maxlength="6" __CODE_REQUIRED__></div>
+  <button type="submit">__LOGIN_BUTTON__</button>
   <div class="status" id="status" style="display:__ERROR_DISPLAY__">__ERROR__</div>
   <a class="subtle-link" href="/forgot-password">Forgot password?</a>
 </form></div></body></html>
@@ -2356,16 +2356,38 @@ class Handler(BaseHTTPRequestHandler):
         secure = "; Secure" if host not in {"localhost", "127.0.0.1", "::1"} else ""
         return f"vs_session={cookie_value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400{secure}"
 
-    def send_redirect(self, location: str, extra_headers: dict[str, str] | None = None) -> None:
+    def send_redirect(self, location: str, extra_headers: dict[str, str | list[str]] | None = None) -> None:
         self.send_response(302)
         self.send_header("Location", location)
         for name, value in (extra_headers or {}).items():
-            self.send_header(name, value)
+            for item in value if isinstance(value, list) else [value]:
+                self.send_header(name, item)
         self.end_headers()
 
-    def send_login(self, error: str = "") -> None:
-        body = LOGIN_PAGE.replace("__ERROR_DISPLAY__", "block" if error else "none").replace("__ERROR__", html.escape(error)).encode("utf-8")
-        self.send_html(body)
+    def send_login(self, error: str = "", show_totp: bool = False, username: str = "", challenge_cookie: str | None = None) -> None:
+        replacements = {
+            "__ERROR_DISPLAY__": "block" if error else "none",
+            "__ERROR__": html.escape(error),
+            "__LOGIN_STAGE__": "totp" if show_totp else "password",
+            "__CREDENTIALS_DISPLAY__": "none" if show_totp else "block",
+            "__CREDENTIALS_STATE__": "disabled" if show_totp else "required",
+            "__LOGIN_USERNAME__": html.escape(username, quote=True),
+            "__HIDDEN_USERNAME__": f'<input type="hidden" name="username" value="{html.escape(username, quote=True)}">' if show_totp else "",
+            "__TOTP_PROMPT_DISPLAY__": "block" if show_totp else "none",
+            "__CODE_DISPLAY__": "block" if show_totp else "none",
+            "__CODE_REQUIRED__": "required" if show_totp else "",
+            "__LOGIN_BUTTON__": "Verify code" if show_totp else "Sign in",
+        }
+        page = LOGIN_PAGE
+        for token, value in replacements.items():
+            page = page.replace(token, value)
+        headers = {"Set-Cookie": challenge_cookie} if challenge_cookie else None
+        self.send_html(page.encode("utf-8"), headers)
+
+    def login_challenge_cookie(self, value: str = "", max_age: int = 300) -> str:
+        host = self.headers.get("Host", "").split(":", 1)[0].lower()
+        secure = "; Secure" if host not in {"localhost", "127.0.0.1", "::1"} else ""
+        return f"vs_login_challenge={value}; Path=/login; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
 
     def send_json(self, payload: object, status: int = 200, extra_headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -2377,9 +2399,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_html(self, body: bytes) -> None:
+    def send_html(self, body: bytes, extra_headers: dict[str, str] | None = None) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -2670,9 +2694,22 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 fields = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
                 username = fields.get("username", fields.get("email", [""]))[0].strip()
-                password = fields.get("password", [""])[0]
-                code = fields.get("code", [""])[0]
-                user = vs_users.authenticate(username, password, code)
+                if fields.get("stage", ["password"])[0] == "totp":
+                    cookies = parse_cookies(self.headers.get("Cookie", ""))
+                    challenge = cookies.get("vs_login_challenge", "")
+                    user = vs_users.complete_login_challenge(challenge, fields.get("code", [""])[0])
+                    if not user:
+                        self.send_login("The authenticator code is incorrect or the sign-in step expired. Refresh this page to start again.", show_totp=True, username=username)
+                        return
+                    vs_users.record_activity(str(user["username"]), "login", str(user["username"]))
+                    headers = {"Set-Cookie": [self.session_cookie_header(make_session_cookie(str(user["username"]))), self.login_challenge_cookie(max_age=0)]}
+                    self.send_redirect("/", headers)
+                    return
+                user = vs_users.authenticate_password(username, fields.get("password", [""])[0])
+                if user and user.get("totp_enabled"):
+                    challenge = vs_users.create_login_challenge(str(user["username"]))
+                    self.send_login(show_totp=True, username=str(user["username"]), challenge_cookie=self.login_challenge_cookie(challenge))
+                    return
                 if user:
                     vs_users.record_activity(str(user["username"]), "login", str(user["username"]))
                     self.send_redirect("/", {"Set-Cookie": self.session_cookie_header(make_session_cookie(str(user["username"])))})

@@ -1723,6 +1723,11 @@ def upload_parts(relative_path: str) -> list[str]:
     return list(destination.relative_to(VS_ROOT).parts)
 
 
+def profile_avatar_path(username: str) -> Path:
+    safe_id = hashlib.sha256(vs_users.normalize_username(username).encode("utf-8")).hexdigest()[:32]
+    return APP_ROOT / "logs" / "avatars" / f"{safe_id}.jpg"
+
+
 STYLE = """
 <style>
 :root{--bg:#f5f7fb;--panel:#fff;--ink:#111827;--muted:#667085;--line:#d7dde8;--accent:#0f766e;--blue:#1d4ed8}
@@ -1735,7 +1740,7 @@ label{font-size:13px;font-weight:750}select,input{width:100%;border:1px solid va
 datalist option{font:inherit}
 button{border:0;background:var(--accent);color:white;border-radius:8px;padding:11px 15px;font-weight:750;cursor:pointer;min-height:42px}button:disabled{opacity:.55;cursor:not-allowed}.secondary{background:var(--blue)}.mutedbtn{background:#475467}
 .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.card{border:1px solid var(--line);border-radius:8px;padding:12px;background:#f8fafc}.card .n{font-weight:800;font-size:22px}.card .t{color:var(--muted);font-size:12px}
-.toolbar{display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin:0 0 12px}.toolbar .field{min-width:210px}.thumb{width:72px;height:72px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:6px}.thumb-cell{width:90px}.login-page{min-height:100vh;display:grid;place-items:center;padding:24px}.login-card{width:min(440px,100%);background:white;border:1px solid var(--line);border-radius:8px;padding:24px;box-shadow:0 18px 40px rgba(16,24,40,.12)}.login-logo{display:block;width:100%;height:96px;object-fit:contain;margin:0 0 22px}.login-card .field{margin-bottom:14px}.logout{display:block;color:#a7b0c0;text-decoration:none;font-size:13px;margin:22px 10px 0}.top-account{position:absolute;right:30px;top:20px;z-index:2}.top-account a{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink);background:#fff;border:1px solid var(--line);border-radius:999px;padding:6px 13px 6px 6px;box-shadow:0 2px 8px rgba(16,24,40,.05)}.account-avatar{display:grid;place-items:center;width:36px;height:36px;border-radius:50%;background:#ede9fe;color:#5b21b6;font-weight:800}.top-account small{display:block;color:var(--muted);font-size:11px;margin-top:2px}.account-main{padding-top:72px!important}.profile-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.totp-key{font:600 18px Consolas,monospace;letter-spacing:.08em;word-break:break-all;background:#f8fafc;border:1px solid var(--line);padding:12px;border-radius:8px}.recovery-link{display:inline-block;margin-top:12px;color:var(--blue)}.subtle-link{color:var(--blue);display:inline-block;margin-top:12px}.code-input{max-width:220px;letter-spacing:.2em;font:700 20px Consolas,monospace}
+.toolbar{display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin:0 0 12px}.toolbar .field{min-width:210px}.thumb{width:72px;height:72px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:6px}.thumb-cell{width:90px}.login-page{min-height:100vh;display:grid;place-items:center;padding:24px}.login-card{width:min(440px,100%);background:white;border:1px solid var(--line);border-radius:8px;padding:24px;box-shadow:0 18px 40px rgba(16,24,40,.12)}.login-logo{display:block;width:100%;height:96px;object-fit:contain;margin:0 0 22px}.login-card .field{margin-bottom:14px}.logout{display:block;color:#a7b0c0;text-decoration:none;font-size:13px;margin:22px 10px 0}.account-nav{display:flex;align-items:center;gap:13px;margin:22px 12px 0;padding:13px 14px;border-radius:10px;background:#1e293b;border:1px solid #35445a;color:#f8fafc;text-decoration:none;font-size:15px;font-weight:750;box-shadow:0 5px 16px rgba(0,0,0,.12);transition:background .15s,transform .15s}.account-nav:hover,.account-nav.active{background:#334155;transform:translateY(-1px)}.account-nav svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}.top-account{position:absolute;right:30px;top:20px;z-index:2}.top-account a{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink);background:#fff;border:1px solid var(--line);border-radius:999px;padding:6px 13px 6px 6px;box-shadow:0 2px 8px rgba(16,24,40,.05)}.account-avatar{display:grid;place-items:center;width:36px;height:36px;border-radius:50%;background:#ede9fe;color:#5b21b6;font-weight:800;overflow:hidden;flex:none}.account-avatar img{width:100%;height:100%;object-fit:cover}.top-account small{display:block;color:var(--muted);font-size:11px;margin-top:2px}.account-main{padding-top:72px!important}.profile-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.totp-key{font:600 18px Consolas,monospace;letter-spacing:.08em;word-break:break-all;background:#f8fafc;border:1px solid var(--line);padding:12px;border-radius:8px}.recovery-link{display:inline-block;margin-top:12px;color:var(--blue)}.subtle-link{color:var(--blue);display:inline-block;margin-top:12px}.code-input{max-width:220px;letter-spacing:.2em;font:700 20px Consolas,monospace}.avatar-panel{display:flex;align-items:center;gap:22px;flex-wrap:wrap}.avatar-large{width:112px;height:112px;border-radius:50%;object-fit:cover;background:#ede9fe;border:4px solid #fff;box-shadow:0 0 0 1px var(--line),0 8px 22px rgba(16,24,40,.12)}.avatar-actions{flex:1;min-width:min(300px,100%)}.avatar-actions .field{margin:0}.avatar-actions input[type=file]{padding:10px;background:#f8fafc}.avatar-actions button{margin-top:12px}
 textarea{width:100%;min-height:220px;border:1px solid var(--line);border-radius:8px;padding:12px;font-family:Consolas,monospace;resize:vertical}
 table{width:100%;border-collapse:collapse;background:white;border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:8px 9px;font-size:13px;vertical-align:top}th{background:#f8fafc}td{word-break:break-word}.status{padding:10px 12px;border-left:4px solid var(--accent);background:#eef7f5;border-radius:0 8px 8px 0;margin:12px 0;display:block}.status:empty{display:none}#usersTable{overflow-x:auto}#usersTable table{min-width:1260px}
 .progress{display:none;margin-top:12px}.progress .track{height:12px;background:#e5e7eb;border-radius:999px;overflow:hidden}.progress .bar{width:0;height:100%;background:var(--accent);transition:width .2s ease}.progress.active .bar{background:linear-gradient(90deg,var(--accent),#22c55e,var(--accent));background-size:180% 100%;animation:slide 1.2s linear infinite}.progress .label{font-size:13px;color:var(--muted);margin-top:7px}@keyframes slide{from{background-position:0 0}to{background-position:180% 0}}
@@ -1776,12 +1781,12 @@ def shell(title: str, active: str, main: str) -> bytes:
         <a class="{'active' if active == 'resizer' else ''}" href="/image-resizer">{icons['grid']}<span>Image Resizer</span></a>
         <a class="{'active' if active == 'database' else ''}" href="/database-project">{icons['database']}<span>Database Project</span></a>
       </nav>
-      <a class="logout" href="/account">Account</a>
+      <a class="account-nav {'active' if active == 'account' else ''}" href="/account" aria-label="Account and profile"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M5 20a7 7 0 0 1 14 0"></path><circle cx="12" cy="12" r="10"></circle></svg><span>Account &amp; profile</span></a>
       <a class="logout" href="/logout">Sign out</a>
     """
     main_class = "account-main" if active == "account" else ""
-    account_script = """<script>fetch('/api/account/profile').then(r=>r.ok?r.json():null).then(u=>{if(!u)return;const name=[u.first_name,u.last_name].filter(Boolean).join(' ')||u.username;document.getElementById('accountName').textContent=name;document.getElementById('accountRole').textContent=u.role==='admin'?'Administrator':'User';document.getElementById('accountAvatar').textContent=([u.first_name,u.last_name].filter(Boolean).map(x=>x[0]).join('')||u.username.slice(0,2)).toUpperCase();}).catch(()=>{});</script>"""
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title><link rel="icon" type="image/png" href="/assets/logoprimexeu.png">{STYLE}</head><body><div class="app"><aside class="side">{nav}</aside><main class="{main_class}"><div class="top-account" id="topAccount"><a href="/account"><span class="account-avatar" id="accountAvatar">VS</span><span><strong id="accountName">Account</strong><small id="accountRole">Profile</small></span></a></div>{main}</main></div>{SCRIPT}{account_script}</body></html>""".encode("utf-8")
+    account_script = """<script>fetch('/api/account/profile').then(r=>r.ok?r.json():null).then(u=>{if(!u)return;const name=[u.first_name,u.last_name].filter(Boolean).join(' ')||u.username;document.getElementById('accountName').textContent=name;document.getElementById('accountRole').textContent=u.role==='admin'?'Administrator':'User';const box=document.getElementById('accountAvatar'),initials=([u.first_name,u.last_name].filter(Boolean).map(x=>x[0]).join('')||u.username.slice(0,2)).toUpperCase();box.textContent=initials;const img=new Image();img.alt='';img.onload=()=>{box.textContent='';box.appendChild(img)};img.src='/api/account/avatar?v='+Date.now();}).catch(()=>{});</script>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title><link rel="icon" type="image/png" href="/assets/logoprimexeu.png">{STYLE}</head><body><div class="app"><aside class="side">{nav}</aside><main class="{main_class}"><div class="top-account" id="topAccount"><a href="/account" aria-label="Open your account"><span class="account-avatar" id="accountAvatar">VS</span><span><strong id="accountName">Account</strong><small id="accountRole">Profile</small></span></a></div>{main}</main></div>{SCRIPT}{account_script}</body></html>""".encode("utf-8")
 
 
 LOGIN_PAGE = """
@@ -1799,7 +1804,7 @@ LOGIN_PAGE = """
 
 
 ACCOUNT_PAGE = """
-<h1>My account</h1><p class="hint">Manage your profile, sign-in security, and password.</p>
+<h1 class="icon-title"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M5 20a7 7 0 0 1 14 0"></path><circle cx="12" cy="12" r="10"></circle></svg>My account</h1><p class="hint">Manage your profile, sign-in security, and password.</p>
 __ADMIN_LINK__
 <section class="panel"><h2>Profile</h2><p class="hint">Your name and email are visible to administrators in user management and work activity.</p>
   <form id="profileForm"><div class="profile-grid">
@@ -1809,6 +1814,9 @@ __ADMIN_LINK__
     <div class="field"><label>Username</label><input id="profileUsername" readonly aria-readonly="true"></div>
   </div><div class="actions"><button type="submit">Save profile</button></div></form>
   <div class="status" id="profileStatus" role="status"></div>
+</section>
+<section class="panel"><h2 class="icon-title"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h3l2-3h6l2 3h3a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z"></path><circle cx="12" cy="13" r="4"></circle></svg>Profile photo</h2><p class="hint">Add a photo so teammates can quickly recognize your account. Choose a JPEG, PNG, or WebP image up to 5 MB.</p>
+  <div class="avatar-panel"><img id="profileAvatarPreview" class="avatar-large" alt="Your profile photo preview"><div class="avatar-actions"><form id="avatarForm"><div class="field"><label for="avatarFile">Choose a profile photo</label><input id="avatarFile" name="avatar" type="file" accept="image/jpeg,image/png,image/webp" required></div><button type="submit"><svg viewBox="0 0 24 24" aria-hidden="true" style="width:18px;height:18px;vertical-align:-4px;margin-right:6px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M12 16V4m-5 5 5-5 5 5"></path><path d="M4 16v4h16v-4"></path></svg>Upload profile photo</button></form><div class="status" id="avatarStatus" role="status" aria-live="polite"></div></div></div>
 </section>
 <section class="panel"><h2>Two-factor authentication</h2><p id="twoFactorState" class="hint">__TOTP_STATE__</p>
   <div id="totpSetupControls"><button id="beginTotp" type="button" class="secondary">Set up authenticator</button></div>
@@ -1827,8 +1835,10 @@ __ADMIN_LINK__
 <script>
 const $=id=>document.getElementById(id);async function accountPost(url,body){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw new Error(d.error||"Request failed.");return d;}
 (async()=>{const currentProfile=await fetch("/api/account/profile").then(r=>{if(!r.ok)throw new Error("Could not load account profile.");return r.json();});$("firstName").value=currentProfile.first_name||"";$("lastName").value=currentProfile.last_name||"";$("profileEmail").value=currentProfile.email||"";$("profileUsername").value=currentProfile.username;
+const avatarPreview=$("profileAvatarPreview"),avatarFile=$("avatarFile");avatarPreview.onerror=()=>{avatarPreview.onerror=null;avatarPreview.src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 112 112'%3E%3Crect width='112' height='112' rx='56' fill='%23ede9fe'/%3E%3Ctext x='56' y='68' text-anchor='middle' font-family='Arial' font-size='38' font-weight='700' fill='%235b21b6'%3E"+encodeURIComponent((currentProfile.first_name?.[0]||currentProfile.username?.[0]||"U").toUpperCase())+"%3C/text%3E%3C/svg%3E";};avatarPreview.src="/api/account/avatar?v="+Date.now();avatarFile.addEventListener("change",()=>{const file=avatarFile.files?.[0];if(file){if(!["image/jpeg","image/png","image/webp"].includes(file.type)){ $("avatarStatus").textContent="Choose a JPEG, PNG, or WebP image.";avatarFile.value="";return;}avatarPreview.onerror=null;avatarPreview.src=URL.createObjectURL(file);}});
 $("totpSetupControls").hidden=currentProfile.totp_enabled;$("disableTotpForm").hidden=!currentProfile.totp_enabled;
-$("profileForm").addEventListener("submit",async e=>{e.preventDefault();try{await accountPost("/api/account/profile",{first_name:$("firstName").value,last_name:$("lastName").value,email:$("profileEmail").value});$("profileStatus").textContent="Profile saved.";$("accountName").textContent=[$("firstName").value,$("lastName").value].filter(Boolean).join(" ")||currentProfile.username;$("accountAvatar").textContent=([$("firstName").value,$("lastName").value].filter(Boolean).map(x=>x[0]).join("")||currentProfile.username.slice(0,2)).toUpperCase();}catch(err){$("profileStatus").textContent=err.message;}});
+$("profileForm").addEventListener("submit",async e=>{e.preventDefault();try{await accountPost("/api/account/profile",{first_name:$("firstName").value,last_name:$("lastName").value,email:$("profileEmail").value});$("profileStatus").textContent="Profile saved.";$("accountName").textContent=[$("firstName").value,$("lastName").value].filter(Boolean).join(" ")||currentProfile.username;const topAvatar=$("accountAvatar");if(!topAvatar.querySelector("img"))topAvatar.textContent=([$("firstName").value,$("lastName").value].filter(Boolean).map(x=>x[0]).join("")||currentProfile.username.slice(0,2)).toUpperCase();}catch(err){$("profileStatus").textContent=err.message;}});
+$("avatarForm").addEventListener("submit",async e=>{e.preventDefault();const file=avatarFile.files?.[0];if(!file){$("avatarStatus").textContent="Choose a photo first.";return;}if(file.size>5*1024*1024){$("avatarStatus").textContent="The photo must be 5 MB or smaller.";return;}const data=new FormData();data.append("avatar",file);try{const response=await fetch("/api/account/avatar",{method:"POST",body:data});const result=await response.json();if(!response.ok)throw new Error(result.error||"Upload failed.");avatarPreview.onerror=null;avatarPreview.src=result.url;const top=document.getElementById("accountAvatar");top.textContent="";const image=new Image();image.alt="";image.src=result.url;top.appendChild(image);$("avatarStatus").textContent="Profile photo updated.";avatarFile.value="";}catch(err){$("avatarStatus").textContent=err.message;}});
 $("beginTotp").addEventListener("click",async()=>{try{const d=await accountPost("/api/account/totp",{action:"begin"});$("totpSecret").textContent=d.secret;$("totpUri").textContent=d.uri;$("totpSetupPanel").hidden=false;$("totpSetupControls").hidden=true;$("totpStatus").textContent="Add this key to your authenticator app, then confirm the code.";}catch(err){$("totpStatus").textContent=err.message;}});
 $("cancelTotp").addEventListener("click",()=>{$("totpSetupPanel").hidden=true;$("totpSetupControls").hidden=false;$("totpStatus").textContent="Setup cancelled.";});
 $("enableTotpForm").addEventListener("submit",async e=>{e.preventDefault();try{await accountPost("/api/account/totp",{action:"enable",password:$("enableTotpPassword").value,code:$("enableTotpCode").value});$("twoFactorState").textContent="Two-factor authentication is enabled. You will need an authenticator code at sign-in.";$("totpStatus").textContent="2FA enabled. Other signed-in sessions have been closed.";$("totpSetupPanel").hidden=true;$("disableTotpForm").hidden=false;e.target.reset();}catch(err){$("totpStatus").textContent=err.message;}});
@@ -2453,6 +2463,21 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.send_redirect("/login")
                 return
+            if route == "/api/account/avatar":
+                user = self.current_user() or {}
+                avatar = profile_avatar_path(str(user.get("username", "")))
+                if not avatar.is_file():
+                    self.send_error(404)
+                    return
+                data = avatar.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Cache-Control", "private, no-cache, no-store, must-revalidate")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if route == "/":
                 self.send_html(shell("Upload Images", "upload", UPLOAD_PAGE))
                 return
@@ -2680,6 +2705,47 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not self.is_authenticated():
                 self.send_json({"error": "Login required."}, 401)
+                return
+            if route == "/api/account/avatar":
+                content_type = self.headers.get("Content-Type", "")
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                if not content_type.startswith("multipart/form-data"):
+                    raise ValueError("Choose an image file to upload.")
+                if length > 6 * 1024 * 1024:
+                    raise ValueError("The photo must be 5 MB or smaller.")
+                form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)})
+                field = form["avatar"] if "avatar" in form else None
+                if field is None or not getattr(field, "filename", ""):
+                    raise ValueError("Choose a photo first.")
+                data = field.file.read(5 * 1024 * 1024 + 1)
+                if not data or len(data) > 5 * 1024 * 1024:
+                    raise ValueError("The photo must be between 1 byte and 5 MB.")
+                if Image is None or ImageOps is None:
+                    raise ValueError("Image processing is unavailable on this server.")
+                try:
+                    with Image.open(__import__("io").BytesIO(data)) as source:
+                        if source.format not in {"JPEG", "PNG", "WEBP"}:
+                            raise ValueError("Use a JPEG, PNG, or WebP photo.")
+                        if source.width > 6000 or source.height > 6000:
+                            raise ValueError("The photo dimensions must be 6000 × 6000 pixels or smaller.")
+                        source.load()
+                        prepared = ImageOps.fit(ImageOps.exif_transpose(source).convert("RGB"), (512, 512), method=Image.Resampling.LANCZOS)
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    raise ValueError("The selected file is not a valid supported image.") from exc
+                user = self.current_user() or {}
+                actor = str(user.get("username", ""))
+                destination = profile_avatar_path(actor)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                temporary = destination.with_suffix(f".{secrets.token_hex(6)}.tmp")
+                try:
+                    prepared.save(temporary, format="JPEG", quality=88, optimize=True)
+                    os.replace(temporary, destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                vs_users.record_activity(actor, "profile_photo_changed", actor)
+                self.send_json({"ok": True, "url": "/api/account/avatar?v=" + str(int(time.time()))})
                 return
             if route in {"/api/account/profile", "/api/account/totp", "/api/account/password", "/api/admin/users"}:
                 payload = self.read_json_body()

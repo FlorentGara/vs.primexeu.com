@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import cgi
+import mimetypes
 from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
@@ -9,6 +10,8 @@ import hmac
 import json
 import math
 import os
+import smtplib
+import sys
 import re
 import secrets
 import shutil
@@ -17,10 +20,12 @@ import threading
 import time
 import tempfile
 import zipfile
+from email.message import EmailMessage
 import xml.etree.ElementTree as ET
+import vs_users
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -44,9 +49,6 @@ USER_HOME = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or str(
 BASE_URL = os.environ.get("VS_BASE_URL", "https://primexeu.com/photos/VS/").rstrip("/") + "/"
 HOST = os.environ.get("VS_DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VS_DASHBOARD_PORT", "8791"))
-LOGIN_EMAIL = os.environ.get("VS_DASHBOARD_USER", "info@primexeu.com")
-LOGIN_PASSWORD = os.environ.get("VS_DASHBOARD_PASSWORD", "Primex1!")
-SESSION_SECRET = os.environ.get("VS_DASHBOARD_SESSION_SECRET") or secrets.token_urlsafe(32)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 URL_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
 LOGO_SCAN_EXTENSIONS = IMAGE_EXTENSIONS | {".gif", ".bmp", ".tif", ".tiff", ".pjg"}
@@ -69,13 +71,8 @@ JOBS_LOCK = threading.Lock()
 AMAZON_JOB_LOCK = threading.Lock()
 
 
-def sign_session(value: str) -> str:
-    return hmac.new(SESSION_SECRET.encode("utf-8"), value.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def make_session_cookie() -> str:
-    value = f"{LOGIN_EMAIL}|{int(time.time())}|{secrets.token_urlsafe(18)}"
-    return f"{value}|{sign_session(value)}"
+def make_session_cookie(username: str) -> str:
+    return vs_users.issue_session(username)
 
 
 def parse_cookies(header: str) -> dict[str, str]:
@@ -87,14 +84,46 @@ def parse_cookies(header: str) -> dict[str, str]:
     return cookies
 
 
+def session_user(cookie_value: str) -> dict[str, object] | None:
+    return vs_users.session_user(cookie_value)
+
+
 def is_valid_session(cookie_value: str) -> bool:
-    parts = cookie_value.split("|")
-    if len(parts) != 4:
-        return False
-    value = "|".join(parts[:3])
-    if parts[0] != LOGIN_EMAIL:
-        return False
-    return hmac.compare_digest(parts[3], sign_session(value))
+    return session_user(cookie_value) is not None
+
+
+def _smtp_is_configured() -> bool:
+    return bool(os.environ.get("VS_SMTP_HOST", "").strip() and os.environ.get("VS_SMTP_FROM", os.environ.get("VS_SMTP_USER", "")).strip())
+
+
+def _send_password_reset_email(recipient: str, token: str) -> None:
+    host = os.environ.get("VS_SMTP_HOST", "").strip()
+    sender = os.environ.get("VS_SMTP_FROM", os.environ.get("VS_SMTP_USER", "")).strip()
+    if not host or not sender:
+        raise RuntimeError("Password recovery email is not configured. Set VS_SMTP_HOST and VS_SMTP_FROM in the server .env file.")
+    port = int(os.environ.get("VS_SMTP_PORT", "587"))
+    username = os.environ.get("VS_SMTP_USER", "").strip()
+    password = os.environ.get("VS_SMTP_PASSWORD", "")
+    use_ssl = os.environ.get("VS_SMTP_SSL", "0").strip().lower() in {"1", "true", "yes"}
+    starttls = os.environ.get("VS_SMTP_STARTTLS", "1").strip().lower() in {"1", "true", "yes"}
+    public_url = os.environ.get("VS_PUBLIC_URL", "https://vs.primexeu.com").rstrip("/")
+    reset_url = f"{public_url}/reset-password?token={quote(token, safe='')}"
+    message = EmailMessage()
+    message["Subject"] = "Reset your Primex VS Tools password"
+    message["From"] = sender
+    message["To"] = recipient
+    message.set_content(
+        "A password reset was requested for your Primex VS Tools account.\n\n"
+        f"Use this link within 30 minutes: {reset_url}\n\n"
+        "If you did not request this, you can ignore this email."
+    )
+    smtp_type = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+    with smtp_type(host, port, timeout=20) as smtp:
+        if not use_ssl and starttls:
+            smtp.starttls()
+        if username:
+            smtp.login(username, password)
+        smtp.send_message(message)
 
 
 def is_safe_name(value: str) -> bool:
@@ -158,10 +187,18 @@ def list_product_folders(top_name: str) -> list[dict[str, object]]:
     except ValueError:
         return []
     products = []
+    owners = vs_users.folder_owner_map(top_name)
     for path in top.iterdir():
         if path.is_dir():
             item = stat_payload(path)
             item["imageCount"] = count_images(path)
+            owner = owners.get(path.name, {})
+            item["createdBy"] = owner.get("createdBy", "")
+            item["createdByName"] = owner.get("createdByName", "")
+            item["createdAt"] = owner.get("createdAt", "")
+            item["lastBy"] = owner.get("lastBy", "")
+            item["lastByName"] = owner.get("lastByName", "")
+            item["lastAt"] = owner.get("lastAt", "")
             products.append(item)
     products.sort(key=lambda item: (-int(item["modified"]), str(item["name"]).lower()))
     return products
@@ -399,6 +436,7 @@ def finish_job_counts(job_id: str) -> None:
 
 def run_upload_automation_job(
     job_id: str,
+    actor: str,
     relative_parts: list[str],
     quantities: list[str],
     export_format: str,
@@ -419,6 +457,8 @@ def run_upload_automation_job(
             organize_rows = organize_photos(top_name, top_name, True)
             for row in organize_rows:
                 row["step"] = "organize"
+                if row.get("status") in {"copied", "moved"} and row.get("target"):
+                    vs_users.record_photo_activity(actor, f"photo_{row['status']}", row["target"], {"source": row.get("file", "")})
                 if delete_source and row.get("status") == "moved":
                     row.pop("url", None)
                     row["message"] = "Temporary source; removed after successful grid generation"
@@ -444,6 +484,10 @@ def run_upload_automation_job(
             grid_rows = generate_grid_images(top_name, product, quantities, export_format, delete_source, cache_bust)
             for row in grid_rows:
                 row["step"] = "grid"
+                if row.get("status") == "created" and row.get("created"):
+                    vs_users.record_photo_activity(
+                        actor, "grid_created", f"{top_name}/{product}/{row['created']}", {"source": row.get("source", "")}
+                    )
                 if row.get("status") == "created" and row.get("url"):
                     final_url_rows.append({
                         "step": "url",
@@ -453,6 +497,10 @@ def run_upload_automation_job(
                         "url": row["url"],
                     })
             append_job_rows(job_id, grid_rows)
+            if delete_source:
+                deleted_sources = {row.get("source", "") for row in grid_rows if row.get("status") == "created" and row.get("source")}
+                for source_name in deleted_sources:
+                    vs_users.record_photo_activity(actor, "source_deleted_after_grid", f"{top_name}/{product}/{source_name}")
             finish_job_counts(job_id)
 
         update_job(job_id, phase="collecting urls", percent=92, message="Collecting final URLs...")
@@ -1687,12 +1735,12 @@ label{font-size:13px;font-weight:750}select,input{width:100%;border:1px solid va
 datalist option{font:inherit}
 button{border:0;background:var(--accent);color:white;border-radius:8px;padding:11px 15px;font-weight:750;cursor:pointer;min-height:42px}button:disabled{opacity:.55;cursor:not-allowed}.secondary{background:var(--blue)}.mutedbtn{background:#475467}
 .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.card{border:1px solid var(--line);border-radius:8px;padding:12px;background:#f8fafc}.card .n{font-weight:800;font-size:22px}.card .t{color:var(--muted);font-size:12px}
-.toolbar{display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin:0 0 12px}.toolbar .field{min-width:210px}.thumb{width:72px;height:72px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:6px}.thumb-cell{width:90px}.login-page{min-height:100vh;display:grid;place-items:center;padding:24px}.login-card{width:min(420px,100%);background:white;border:1px solid var(--line);border-radius:8px;padding:24px;box-shadow:0 18px 40px rgba(16,24,40,.12)}.login-logo{display:block;width:100%;height:96px;object-fit:contain;margin:0 0 22px}.login-card .field{margin-bottom:14px}.logout{display:block;color:#a7b0c0;text-decoration:none;font-size:13px;margin:22px 10px 0}
+.toolbar{display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin:0 0 12px}.toolbar .field{min-width:210px}.thumb{width:72px;height:72px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:6px}.thumb-cell{width:90px}.login-page{min-height:100vh;display:grid;place-items:center;padding:24px}.login-card{width:min(440px,100%);background:white;border:1px solid var(--line);border-radius:8px;padding:24px;box-shadow:0 18px 40px rgba(16,24,40,.12)}.login-logo{display:block;width:100%;height:96px;object-fit:contain;margin:0 0 22px}.login-card .field{margin-bottom:14px}.logout{display:block;color:#a7b0c0;text-decoration:none;font-size:13px;margin:22px 10px 0}.top-account{position:absolute;right:30px;top:20px;z-index:2}.top-account a{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink);background:#fff;border:1px solid var(--line);border-radius:999px;padding:6px 13px 6px 6px;box-shadow:0 2px 8px rgba(16,24,40,.05)}.account-avatar{display:grid;place-items:center;width:36px;height:36px;border-radius:50%;background:#ede9fe;color:#5b21b6;font-weight:800}.top-account small{display:block;color:var(--muted);font-size:11px;margin-top:2px}.account-main{padding-top:72px!important}.profile-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.totp-key{font:600 18px Consolas,monospace;letter-spacing:.08em;word-break:break-all;background:#f8fafc;border:1px solid var(--line);padding:12px;border-radius:8px}.recovery-link{display:inline-block;margin-top:12px;color:var(--blue)}.subtle-link{color:var(--blue);display:inline-block;margin-top:12px}.code-input{max-width:220px;letter-spacing:.2em;font:700 20px Consolas,monospace}
 textarea{width:100%;min-height:220px;border:1px solid var(--line);border-radius:8px;padding:12px;font-family:Consolas,monospace;resize:vertical}
-table{width:100%;border-collapse:collapse;background:white;border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:8px 9px;font-size:13px;vertical-align:top}th{background:#f8fafc}td{word-break:break-word}.status{padding:10px 12px;border-left:4px solid var(--accent);background:#eef7f5;border-radius:0 8px 8px 0;margin:12px 0;display:none}
+table{width:100%;border-collapse:collapse;background:white;border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:8px 9px;font-size:13px;vertical-align:top}th{background:#f8fafc}td{word-break:break-word}.status{padding:10px 12px;border-left:4px solid var(--accent);background:#eef7f5;border-radius:0 8px 8px 0;margin:12px 0;display:block}.status:empty{display:none}#usersTable{overflow-x:auto}#usersTable table{min-width:1260px}
 .progress{display:none;margin-top:12px}.progress .track{height:12px;background:#e5e7eb;border-radius:999px;overflow:hidden}.progress .bar{width:0;height:100%;background:var(--accent);transition:width .2s ease}.progress.active .bar{background:linear-gradient(90deg,var(--accent),#22c55e,var(--accent));background-size:180% 100%;animation:slide 1.2s linear infinite}.progress .label{font-size:13px;color:var(--muted);margin-top:7px}@keyframes slide{from{background-position:0 0}to{background-position:180% 0}}
 .image-drop{border:2px dashed var(--line);border-radius:8px;padding:22px;text-align:center;cursor:pointer;background:#f8fafc;display:grid;gap:5px}.image-drop.dragging,.image-drop:focus{border-color:var(--accent);background:#eef7f5;outline:none}.image-drop span{color:var(--muted);font-size:13px}.image-drop input{margin:8px auto 0;max-width:420px}.image-preview{max-width:min(100%,360px);max-height:260px;object-fit:contain;border:1px solid var(--line);border-radius:8px;margin-top:14px;background:#fff}
-@media(max-width:900px){.app{grid-template-columns:1fr}.grid,.cards{grid-template-columns:1fr}.side{position:relative}}
+@media(max-width:900px){.app{grid-template-columns:1fr}.grid,.cards,.profile-grid{grid-template-columns:1fr}.side{position:relative}.top-account{position:static;display:flex;justify-content:flex-end;margin:-12px 0 14px}.account-main{padding-top:20px!important}}
 </style>
 """
 
@@ -1728,21 +1776,108 @@ def shell(title: str, active: str, main: str) -> bytes:
         <a class="{'active' if active == 'resizer' else ''}" href="/image-resizer">{icons['grid']}<span>Image Resizer</span></a>
         <a class="{'active' if active == 'database' else ''}" href="/database-project">{icons['database']}<span>Database Project</span></a>
       </nav>
+      <a class="logout" href="/account">Account</a>
       <a class="logout" href="/logout">Sign out</a>
     """
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title><link rel="icon" type="image/png" href="/assets/logoprimexeu.png">{STYLE}</head><body><div class="app"><aside class="side">{nav}</aside><main>{main}</main></div>{SCRIPT}</body></html>""".encode("utf-8")
+    main_class = "account-main" if active == "account" else ""
+    account_script = """<script>fetch('/api/account/profile').then(r=>r.ok?r.json():null).then(u=>{if(!u)return;const name=[u.first_name,u.last_name].filter(Boolean).join(' ')||u.username;document.getElementById('accountName').textContent=name;document.getElementById('accountRole').textContent=u.role==='admin'?'Administrator':'User';document.getElementById('accountAvatar').textContent=([u.first_name,u.last_name].filter(Boolean).map(x=>x[0]).join('')||u.username.slice(0,2)).toUpperCase();}).catch(()=>{});</script>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title><link rel="icon" type="image/png" href="/assets/logoprimexeu.png">{STYLE}</head><body><div class="app"><aside class="side">{nav}</aside><main class="{main_class}"><div class="top-account" id="topAccount"><a href="/account"><span class="account-avatar" id="accountAvatar">VS</span><span><strong id="accountName">Account</strong><small id="accountRole">Profile</small></span></a></div>{main}</main></div>{SCRIPT}{account_script}</body></html>""".encode("utf-8")
 
 
 LOGIN_PAGE = """
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VS Tools Login</title><link rel="icon" type="image/png" href="/assets/logoprimexeu.png">__STYLE__</head>
 <body><div class="login-page"><form class="login-card" method="post" action="/login">
   <img class="login-logo" src="/assets/logoprimexeu.png" alt="Primex EU">
-  <div class="field"><label>Email</label><input name="email" type="email" autocomplete="username" required></div>
-  <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password" required></div>
+  <div class="field"><label for="loginUsername">Email or username</label><input id="loginUsername" name="username" type="text" autocomplete="username" required></div>
+  <div class="field"><label for="loginPassword">Password</label><input id="loginPassword" name="password" type="password" autocomplete="current-password" required></div>
+  <div class="field"><label for="loginCode">Authenticator code <span class="hint">(only if 2FA is enabled)</span></label><input id="loginCode" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,8}" maxlength="8"></div>
   <button type="submit">Sign in</button>
   <div class="status" id="status" style="display:__ERROR_DISPLAY__">__ERROR__</div>
+  <a class="subtle-link" href="/forgot-password">Forgot password?</a>
 </form></div></body></html>
 """.replace("__STYLE__", STYLE)
+
+
+ACCOUNT_PAGE = """
+<h1>My account</h1><p class="hint">Manage your profile, sign-in security, and password.</p>
+__ADMIN_LINK__
+<section class="panel"><h2>Profile</h2><p class="hint">Your name and email are visible to administrators in user management and work activity.</p>
+  <form id="profileForm"><div class="profile-grid">
+    <div class="field"><label for="firstName">First name</label><input id="firstName" maxlength="80" autocomplete="given-name" required></div>
+    <div class="field"><label for="lastName">Last name</label><input id="lastName" maxlength="80" autocomplete="family-name" required></div>
+    <div class="field"><label for="profileEmail">Email for password recovery</label><input id="profileEmail" type="email" maxlength="254" autocomplete="email" required></div>
+    <div class="field"><label>Username</label><input id="profileUsername" readonly aria-readonly="true"></div>
+  </div><div class="actions"><button type="submit">Save profile</button></div></form>
+  <div class="status" id="profileStatus" role="status"></div>
+</section>
+<section class="panel"><h2>Two-factor authentication</h2><p id="twoFactorState" class="hint">__TOTP_STATE__</p>
+  <div id="totpSetupControls"><button id="beginTotp" type="button" class="secondary">Set up authenticator</button></div>
+  <div id="totpSetupPanel" hidden><p>In your authenticator app choose “enter setup key” and add this account. Confirm with the current six-digit code to finish.</p><div class="totp-key" id="totpSecret"></div><details><summary>Show setup URI</summary><p><code id="totpUri"></code></p></details>
+    <form id="enableTotpForm"><div class="profile-grid"><div class="field"><label for="enableTotpPassword">Current password</label><input id="enableTotpPassword" type="password" autocomplete="current-password" required></div><div class="field"><label for="enableTotpCode">Authenticator code</label><input id="enableTotpCode" class="code-input" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6}" maxlength="6" required></div></div><div class="actions"><button type="submit">Confirm and enable 2FA</button><button id="cancelTotp" type="button" class="mutedbtn">Cancel</button></div></form>
+  </div>
+  <form id="disableTotpForm" hidden><p>To turn off 2FA, confirm your password and the current authenticator code.</p><div class="profile-grid"><div class="field"><label for="disableTotpPassword">Current password</label><input id="disableTotpPassword" type="password" autocomplete="current-password" required></div><div class="field"><label for="disableTotpCode">Authenticator code</label><input id="disableTotpCode" class="code-input" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6}" maxlength="6" required></div></div><div class="actions"><button type="submit" class="mutedbtn">Turn off 2FA</button></div></form>
+  <div class="status" id="totpStatus" role="status"></div>
+</section>
+<section class="panel"><h2>Change password</h2><form id="changePasswordForm"><div class="profile-grid">
+  <div class="field"><label for="currentPassword">Current password</label><input id="currentPassword" type="password" autocomplete="current-password" required></div>
+  <div class="field"><label for="newPassword">New password</label><input id="newPassword" type="password" autocomplete="new-password" minlength="8" required></div>
+  <div class="field"><label for="confirmPassword">Confirm new password</label><input id="confirmPassword" type="password" autocomplete="new-password" minlength="8" required></div>
+ </div><div class="actions"><button type="submit">Change password</button></div></form><div class="status" id="passwordStatus" role="status"></div>
+</section>
+<script>
+const $=id=>document.getElementById(id);async function accountPost(url,body){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw new Error(d.error||"Request failed.");return d;}
+(async()=>{const currentProfile=await fetch("/api/account/profile").then(r=>{if(!r.ok)throw new Error("Could not load account profile.");return r.json();});$("firstName").value=currentProfile.first_name||"";$("lastName").value=currentProfile.last_name||"";$("profileEmail").value=currentProfile.email||"";$("profileUsername").value=currentProfile.username;
+$("totpSetupControls").hidden=currentProfile.totp_enabled;$("disableTotpForm").hidden=!currentProfile.totp_enabled;
+$("profileForm").addEventListener("submit",async e=>{e.preventDefault();try{await accountPost("/api/account/profile",{first_name:$("firstName").value,last_name:$("lastName").value,email:$("profileEmail").value});$("profileStatus").textContent="Profile saved.";$("accountName").textContent=[$("firstName").value,$("lastName").value].filter(Boolean).join(" ")||currentProfile.username;$("accountAvatar").textContent=([$("firstName").value,$("lastName").value].filter(Boolean).map(x=>x[0]).join("")||currentProfile.username.slice(0,2)).toUpperCase();}catch(err){$("profileStatus").textContent=err.message;}});
+$("beginTotp").addEventListener("click",async()=>{try{const d=await accountPost("/api/account/totp",{action:"begin"});$("totpSecret").textContent=d.secret;$("totpUri").textContent=d.uri;$("totpSetupPanel").hidden=false;$("totpSetupControls").hidden=true;$("totpStatus").textContent="Add this key to your authenticator app, then confirm the code.";}catch(err){$("totpStatus").textContent=err.message;}});
+$("cancelTotp").addEventListener("click",()=>{$("totpSetupPanel").hidden=true;$("totpSetupControls").hidden=false;$("totpStatus").textContent="Setup cancelled.";});
+$("enableTotpForm").addEventListener("submit",async e=>{e.preventDefault();try{await accountPost("/api/account/totp",{action:"enable",password:$("enableTotpPassword").value,code:$("enableTotpCode").value});$("twoFactorState").textContent="Two-factor authentication is enabled. You will need an authenticator code at sign-in.";$("totpStatus").textContent="2FA enabled. Other signed-in sessions have been closed.";$("totpSetupPanel").hidden=true;$("disableTotpForm").hidden=false;e.target.reset();}catch(err){$("totpStatus").textContent=err.message;}});
+$("disableTotpForm").addEventListener("submit",async e=>{e.preventDefault();try{await accountPost("/api/account/totp",{action:"disable",password:$("disableTotpPassword").value,code:$("disableTotpCode").value});$("twoFactorState").textContent="Two-factor authentication is off. Sign-in uses your password.";$("totpStatus").textContent="2FA turned off. Other signed-in sessions have been closed.";$("disableTotpForm").hidden=true;$("totpSetupControls").hidden=false;e.target.reset();}catch(err){$("totpStatus").textContent=err.message;}});
+$("changePasswordForm").addEventListener("submit",async e=>{e.preventDefault();const next=$("newPassword").value;if(next!==$("confirmPassword").value){$("passwordStatus").textContent="New passwords do not match.";return;}try{await accountPost("/api/account/password",{current_password:$("currentPassword").value,new_password:next});$("passwordStatus").textContent="Password changed. Other signed-in sessions have been closed.";e.target.reset();}catch(err){$("passwordStatus").textContent=err.message;}});
+})().catch(err=>$("profileStatus").textContent=err.message);
+</script>
+"""
+
+
+FORGOT_PASSWORD_PAGE = """
+<h1>Forgot password</h1><p class="hint">Enter the email address saved in your account. If it matches an account, we will send a reset link.</p>
+<section class="panel"><form id="requestResetForm"><div class="field"><label for="resetEmail">Email address</label><input id="resetEmail" type="email" autocomplete="email" required></div><div class="actions"><button type="submit">Send reset link</button><a class="subtle-link" href="/login">Back to sign in</a></div></form><div class="status" id="resetRequestStatus" role="status"></div></section>
+<script>document.getElementById("requestResetForm").addEventListener("submit",async e=>{e.preventDefault();const s=document.getElementById("resetRequestStatus");try{const r=await fetch("/api/password-reset/request",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:document.getElementById("resetEmail").value})});const d=await r.json();if(!r.ok)throw new Error(d.error||"Could not request reset.");s.textContent=d.message;}catch(err){s.textContent=err.message;}});</script>
+"""
+
+
+RESET_PASSWORD_PAGE = """
+<h1>Set a new password</h1><p class="hint">Reset links expire after 30 minutes and can only be used once.</p>
+<section class="panel"><form id="completeResetForm"><input type="hidden" id="resetToken" value="__RESET_TOKEN__"><div class="profile-grid"><div class="field"><label for="resetNewPassword">New password</label><input id="resetNewPassword" type="password" autocomplete="new-password" minlength="8" required></div><div class="field"><label for="resetConfirmPassword">Confirm new password</label><input id="resetConfirmPassword" type="password" autocomplete="new-password" minlength="8" required></div></div><div class="actions"><button type="submit">Save new password</button></div></form><div class="status" id="resetCompleteStatus" role="status"></div></section>
+<script>document.getElementById("completeResetForm").addEventListener("submit",async e=>{e.preventDefault();const s=document.getElementById("resetCompleteStatus"),p=document.getElementById("resetNewPassword").value;if(p!==document.getElementById("resetConfirmPassword").value){s.textContent="Passwords do not match.";return;}try{const r=await fetch("/api/password-reset/complete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:document.getElementById("resetToken").value,password:p})});const d=await r.json();if(!r.ok)throw new Error(d.error||"Reset failed.");s.textContent="Password updated. You can now sign in.";e.target.reset();}catch(err){s.textContent=err.message;}});</script>
+"""
+
+
+ADMIN_USERS_PAGE = """
+<h1>User Management</h1>
+<section class="panel"><h2>Add user</h2>
+  <form id="createUserForm"><div class="grid">
+    <div class="field"><label>Username or email</label><input id="newUsername" maxlength="64" required></div>
+    <div class="field"><label>First name</label><input id="newFirstName" maxlength="80"></div>
+    <div class="field"><label>Last name</label><input id="newLastName" maxlength="80"></div>
+    <div class="field"><label>Email for password recovery</label><input id="newEmail" type="email" maxlength="254"></div>
+    <div class="field"><label>Initial password</label><input id="newUserPassword" type="password" minlength="8" required></div>
+    <div class="field"><label>Role</label><select id="newUserRole"><option value="user">User</option><option value="admin">Administrator</option></select></div>
+  </div><div class="actions"><button type="submit">Add user</button></div></form>
+  <div id="adminStatus" class="status" role="status"></div>
+</section>
+<section class="panel"><h2>Users</h2><div id="usersTable" class="hint">Loading users...</div></section>
+<section class="panel"><h2>Work activity</h2><p class="hint">Shows who uploaded, organized, generated, or changed files. Older folders from before tracking was enabled are marked as untracked.</p><div id="activityTable" class="hint">Loading activity...</div></section>
+<script>
+const adminEsc=value=>String(value??"").replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+async function adminApi(url,body){const res=await fetch(url,body?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{});const data=await res.json();if(!res.ok)throw new Error(data.error||"Request failed.");return data;}
+async function loadUsers(){const data=await adminApi("/api/admin/users");const wrap=document.getElementById("usersTable");if(!data.users.length){wrap.textContent="No users.";return;}wrap.innerHTML=`<table><thead><tr><th>Username</th><th>First name</th><th>Last name</th><th>Email</th><th>Role</th><th>2FA</th><th>Created</th><th>Reset password</th><th>Actions</th></tr></thead><tbody>${data.users.map(user=>`<tr data-user="${adminEsc(user.username)}"><td>${adminEsc(user.username)}${user.active?"":" (disabled)"}</td><td><input class="firstName" maxlength="80" value="${adminEsc(user.first_name)}" aria-label="First name for ${adminEsc(user.username)}"></td><td><input class="lastName" maxlength="80" value="${adminEsc(user.last_name)}" aria-label="Last name for ${adminEsc(user.username)}"></td><td><input class="email" type="email" value="${adminEsc(user.email)}" aria-label="Recovery email for ${adminEsc(user.username)}"></td><td><select class="roleSelect" aria-label="Role for ${adminEsc(user.username)}"><option value="user" ${user.role==="user"?"selected":""}>User</option><option value="admin" ${user.role==="admin"?"selected":""}>Administrator</option></select></td><td>${user.totp_enabled?"On":"Off"}</td><td>${adminEsc(user.created_at)}</td><td><input class="resetPassword" type="password" minlength="8" placeholder="New password" aria-label="Set password for ${adminEsc(user.username)}"></td><td><button type="button" class="saveProfile">Save profile</button> <button type="button" class="saveRole">Save role</button> <button type="button" class="resetUserPassword">Set password</button> <button type="button" class="resetUserTotp">Reset 2FA</button> <button type="button" class="removeUser secondary">Remove</button></td></tr>`).join("")}</tbody></table>`;}
+async function loadActivity(){const data=await adminApi("/api/admin/activity");const wrap=document.getElementById("activityTable");if(!data.activity.length){wrap.textContent="No activity recorded yet.";return;}wrap.innerHTML=`<table><thead><tr><th>Time (UTC)</th><th>User</th><th>Action</th><th>File / target</th><th>Details</th></tr></thead><tbody>${data.activity.map(item=>`<tr><td>${adminEsc(item.happened_at)}</td><td>${adminEsc(item.actor_name?item.actor_name+" ("+item.actor+")":item.actor)}</td><td>${adminEsc(item.action)}</td><td>${adminEsc(item.target)}</td><td>${adminEsc(JSON.stringify(item.detail||{}))}</td></tr>`).join("")}</tbody></table>`;}
+document.getElementById("createUserForm").addEventListener("submit",async event=>{event.preventDefault();const status=document.getElementById("adminStatus");try{await adminApi("/api/admin/users",{action:"create",username:document.getElementById("newUsername").value,first_name:document.getElementById("newFirstName").value,last_name:document.getElementById("newLastName").value,email:document.getElementById("newEmail").value,password:document.getElementById("newUserPassword").value,role:document.getElementById("newUserRole").value});event.target.reset();status.textContent="User created.";await Promise.all([loadUsers(),loadActivity()]);}catch(error){status.textContent=error.message;}});
+document.getElementById("usersTable").addEventListener("click",async event=>{const row=event.target.closest("tr[data-user]");if(!row)return;const username=row.dataset.user;const status=document.getElementById("adminStatus");try{if(event.target.classList.contains("saveProfile")){await adminApi("/api/admin/users",{action:"profile",username,first_name:row.querySelector(".firstName").value,last_name:row.querySelector(".lastName").value,email:row.querySelector(".email").value});status.textContent=`Profile saved for ${username}.`;}else if(event.target.classList.contains("saveRole")){await adminApi("/api/admin/users",{action:"role",username,role:row.querySelector(".roleSelect").value});status.textContent=`Role updated for ${username}.`;}else if(event.target.classList.contains("resetUserPassword")){const password=row.querySelector(".resetPassword").value;if(!password){status.textContent="Enter a new password first.";return;}await adminApi("/api/admin/users",{action:"reset_password",username,password});row.querySelector(".resetPassword").value="";status.textContent=`Password reset for ${username}; their old sessions are closed.`;}else if(event.target.classList.contains("resetUserTotp")){if(!confirm(`Turn off two-factor authentication for ${username}? They will sign in with their password until they enable it again.`))return;await adminApi("/api/admin/users",{action:"reset_2fa",username});status.textContent=`2FA reset for ${username}.`;}else if(event.target.classList.contains("removeUser")){if(!confirm(`Remove account ${username}?`))return;await adminApi("/api/admin/users",{action:"delete",username});status.textContent=`${username} removed.`;}await Promise.all([loadUsers(),loadActivity()]);}catch(error){status.textContent=error.message;}});
+Promise.all([loadUsers(),loadActivity()]).catch(error=>document.getElementById("adminStatus").textContent=error.message);
+</script>
+"""
 
 
 URL_PAGE = """
@@ -1809,7 +1944,7 @@ ORGANIZER_PAGE = """
 
 UPLOAD_PAGE = """
 <h1>Upload Images</h1>
-<p class="hint">Upload directly into the Hetzner photos folder. The fixed base is <strong>/var/www/primexeu.com.shared/photos/VS</strong>; enter only the path after <strong>VS/</strong>.</p>
+<p class="hint">Upload directly into <strong>__VS_ROOT__</strong>. Generated image links use <strong>__VS_BASE_URL__</strong>.</p>
 <section class="panel">
   <div class="grid">
     <div class="field full"><label>Destination path after VS/</label><input id="uploadPath" list="uploadPathSuggestions" autocomplete="off" placeholder="Example: FG or FG/PFH511 or WW2/001374"><datalist id="uploadPathSuggestions"></datalist></div>
@@ -1824,6 +1959,10 @@ UPLOAD_PAGE = """
 </section>
 <section class="panel"><h2>Upload Results</h2><div class="actions"><button class="mutedbtn" id="copyUploadLinksBtn">Copy All Links</button><button class="mutedbtn" id="downloadUploadLinksBtn">Export TXT</button></div><div id="tableWrap" class="hint">No files uploaded yet.</div></section>
 """
+
+UPLOAD_PAGE = UPLOAD_PAGE.replace("__VS_ROOT__", html.escape(str(VS_ROOT))).replace(
+    "__VS_BASE_URL__", html.escape(BASE_URL)
+)
 
 
 EXCEL_PAGE = """
@@ -1949,7 +2088,7 @@ async function api(path){const res=await fetch(path,{cache:"no-store"}); const d
 function matchesSearch(text, query){return !query || String(text||"").toLowerCase().includes(query.toLowerCase());}
 function renderTopFolders(keep){const select=document.getElementById("topFolder"); if(!select)return; const old=keep||select.value; const query=document.getElementById("topSearch")?.value||""; const filtered=topFolderCache.filter(folder=>matchesSearch(folder.name,query)); select.innerHTML=""; filtered.forEach(folder=>{const opt=document.createElement("option"); opt.value=folder.name; opt.textContent=`${folder.name} (${folder.subfolderCount} folders, ${folder.modifiedText})`; select.appendChild(opt);}); if(old&&[...select.options].some(o=>o.value===old))select.value=old; const recent=document.getElementById("recentFolder"); if(recent){const recentOld=recent.value; recent.innerHTML='<option value="">Choose recent top folder</option>'+topFolderCache.slice(0,30).map(folder=>`<option value="${escAttr(folder.name)}">${escAttr(folder.name)} (${escAttr(folder.modifiedText)})</option>`).join(""); if(recentOld&&[...recent.options].some(o=>o.value===recentOld))recent.value=recentOld;}}
 async function loadTopFolders(keep){const data=await api("/api/top-folders"); topFolderCache=data.folders||[]; updateUploadPathSuggestions(); updateExcelTopFolderSuggestions(); renderTopFolders(keep); const tc=document.getElementById("topCount"); if(tc)tc.textContent=data.folders.length; const lf=document.getElementById("latestFolder"); if(lf)lf.textContent=data.folders[0]?.name||"-"; await loadProducts(); status(`Detected ${data.folders.length} top folders. Last refreshed ${new Date().toLocaleTimeString()}.`);}
-function renderProducts(keep){const select=document.getElementById("productFolder"); if(!select)return; const old=keep||select.value; const query=document.getElementById("productSearch")?.value||""; select.innerHTML='<option value="">All product folders</option>'; currentProducts.filter(product=>matchesSearch(product.name,query)).forEach(product=>{const opt=document.createElement("option"); opt.value=product.name; opt.textContent=`${product.name} (${product.imageCount} files, ${product.modifiedText})`; select.appendChild(opt);}); if(old&&[...select.options].some(o=>o.value===old))select.value=old;}
+function renderProducts(keep){const select=document.getElementById("productFolder"); if(!select)return; const old=keep||select.value; const query=document.getElementById("productSearch")?.value||""; select.innerHTML='<option value="">All product folders</option>'; currentProducts.filter(product=>matchesSearch(product.name,query)).forEach(product=>{const opt=document.createElement("option"); opt.value=product.name; const first=product.createdByName?`${product.createdByName} (${product.createdBy})`:product.createdBy;const last=product.lastByName?`${product.lastByName} (${product.lastBy})`:product.lastBy;const tracking=product.createdBy?` · first tracked by ${first}; last updated by ${last}`:" · not tracked yet"; opt.textContent=`${product.name} (${product.imageCount} files, ${product.modifiedText}${tracking})`; select.appendChild(opt);}); if(old&&[...select.options].some(o=>o.value===old))select.value=old;}
 async function loadProducts(){const top=document.getElementById("topFolder")?.value; const select=document.getElementById("productFolder"); if(!select)return; currentProducts=[]; if(top){const data=await api("/api/products?folder="+encodeURIComponent(top)); currentProducts=data.products||[];} renderProducts(); const pc=document.getElementById("productCount"); if(pc)pc.textContent=currentProducts.length;}
 function escAttr(value){return String(value).replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));}
 async function updateUploadPathSuggestions(){const input=document.getElementById("uploadPath"); const list=document.getElementById("uploadPathSuggestions"); if(!input||!list)return; const value=input.value.trim().replace(/\\\\/g,"/"); const parts=value.split("/").filter(Boolean); let suggestions=[]; if(value.includes("/")&&parts[0]){const top=parts[0]; if(!productFolderCache[top]){const data=await api("/api/products?folder="+encodeURIComponent(top)); productFolderCache[top]=data.products||[];} suggestions=productFolderCache[top].map(product=>`${top}/${product.name}`);}else{suggestions=topFolderCache.map(folder=>folder.name); suggestions.push(...topFolderCache.map(folder=>`${folder.name}/`));} list.innerHTML=[...new Set(suggestions)].slice(0,200).map(item=>`<option value="${escAttr(item)}"></option>`).join("");}
@@ -2186,6 +2325,27 @@ class Handler(BaseHTTPRequestHandler):
         cookie = parse_cookies(self.headers.get("Cookie", "")).get("vs_session", "")
         return is_valid_session(cookie)
 
+    def current_user(self) -> dict[str, object] | None:
+        cookie = parse_cookies(self.headers.get("Cookie", "")).get("vs_session", "")
+        return session_user(cookie)
+
+    def read_json_body(self) -> dict[str, object]:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length > 64 * 1024:
+            raise ValueError("Request is too large.")
+        try:
+            value = json.loads(self.rfile.read(length).decode("utf-8", errors="replace") or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("Expected JSON body.") from exc
+        if not isinstance(value, dict):
+            raise ValueError("Expected a JSON object.")
+        return value
+
+    def session_cookie_header(self, cookie_value: str) -> str:
+        host = self.headers.get("Host", "").split(":", 1)[0].lower()
+        secure = "; Secure" if host not in {"localhost", "127.0.0.1", "::1"} else ""
+        return f"vs_session={cookie_value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400{secure}"
+
     def send_redirect(self, location: str, extra_headers: dict[str, str] | None = None) -> None:
         self.send_response(302)
         self.send_header("Location", location)
@@ -2197,10 +2357,12 @@ class Handler(BaseHTTPRequestHandler):
         body = LOGIN_PAGE.replace("__ERROR_DISPLAY__", "block" if error else "none").replace("__ERROR__", html.escape(error)).encode("utf-8")
         self.send_html(body)
 
-    def send_json(self, payload: object, status: int = 200) -> None:
+    def send_json(self, payload: object, status: int = 200, extra_headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -2243,6 +2405,27 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path.rstrip("/") or "/"
         try:
+            # Public photo URLs are intentionally served without dashboard login.
+            # Resolve and constrain every request to VS_ROOT to prevent path traversal.
+            if route.startswith("/photos/"):
+                relative = unquote(route[len("/photos/"):])
+                file_path = (VS_ROOT / relative).resolve()
+                if (
+                    not is_under_root(file_path)
+                    or file_path.suffix.lower() not in URL_EXTENSIONS
+                    or not file_path.is_file()
+                ):
+                    self.send_json({"error": "Not found"}, 404)
+                    return
+                content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(file_path.stat().st_size))
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                with file_path.open("rb") as photo:
+                    shutil.copyfileobj(photo, self.wfile)
+                return
             if route.startswith("/assets/"):
                 if not self.send_asset(route.rsplit("/", 1)[-1]):
                     self.send_error(404)
@@ -2252,6 +2435,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_redirect("/")
                 else:
                     self.send_login()
+                return
+            if route == "/forgot-password":
+                self.send_html(f"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Forgot password</title><link rel=\"icon\" href=\"/assets/logoprimexeu.png\">{STYLE}</head><body><div class=\"login-page\"><main class=\"login-card\"><img class=\"login-logo\" src=\"/assets/logoprimexeu.png\" alt=\"Primex EU\">{FORGOT_PASSWORD_PAGE}</main></div></body></html>".encode("utf-8"))
+                return
+            if route == "/reset-password":
+                token = parse_qs(parsed.query).get("token", [""])[0]
+                page = RESET_PASSWORD_PAGE.replace("__RESET_TOKEN__", html.escape(token, quote=True))
+                self.send_html(f"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Reset password</title><link rel=\"icon\" href=\"/assets/logoprimexeu.png\">{STYLE}</head><body><div class=\"login-page\"><main class=\"login-card\"><img class=\"login-logo\" src=\"/assets/logoprimexeu.png\" alt=\"Primex EU\">{page}</main></div></body></html>".encode("utf-8"))
                 return
             if route == "/logout":
                 self.send_redirect("/login", {"Set-Cookie": "vs_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"})
@@ -2264,6 +2455,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if route == "/":
                 self.send_html(shell("Upload Images", "upload", UPLOAD_PAGE))
+                return
+            if route == "/account":
+                user = self.current_user() or {}
+                admin_link = '<p><a href="/admin/users">Manage users and review work activity</a></p>' if user.get("role") == "admin" else ""
+                totp_state = "Two-factor authentication is enabled. You need a current authenticator code every time you sign in." if user.get("totp_enabled") else "Two-factor authentication is off. You can enable it here; sign-in will then require an authenticator code."
+                page = ACCOUNT_PAGE.replace("__TOTP_STATE__", html.escape(totp_state)).replace("__ADMIN_LINK__", admin_link)
+                self.send_html(shell("Account", "account", page))
+                return
+            if route == "/admin/users":
+                user = self.current_user() or {}
+                if user.get("role") != "admin":
+                    self.send_json({"error": "Administrator access required."}, 403)
+                else:
+                    self.send_html(shell("User Management", "", ADMIN_USERS_PAGE))
                 return
             if route == "/url-generator":
                 self.send_html(shell("Primex URL Generator", "urls", URL_PAGE))
@@ -2305,6 +2510,19 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/database/status":
                 from database_project import table_status
                 self.send_json(table_status())
+                return
+            if route in {"/api/admin/users", "/api/admin/activity"}:
+                user = self.current_user() or {}
+                if user.get("role") != "admin":
+                    self.send_json({"error": "Administrator access required."}, 403)
+                elif route == "/api/admin/users":
+                    self.send_json({"users": vs_users.list_users()})
+                else:
+                    self.send_json({"activity": vs_users.list_activity()})
+                return
+            if route == "/api/account/profile":
+                user = self.current_user() or {}
+                self.send_json({key: user.get(key, "") for key in ("username", "role", "first_name", "last_name", "email", "totp_enabled")})
                 return
             if route in {"/api/database/active-products", "/api/database/calculated-prices"}:
                 from database_project import XLSX_MIME, active_products_report, database_prices_report
@@ -2373,6 +2591,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if route == "/api/generate-images":
                 q = parse_qs(parsed.query)
+                actor = str((self.current_user() or {}).get("username", ""))
                 rows = generate_grid_images(
                     q.get("folder", [""])[0],
                     q.get("product", [""])[0],
@@ -2381,16 +2600,36 @@ class Handler(BaseHTTPRequestHandler):
                     q.get("delete", ["0"])[0] == "1",
                     q.get("cache", ["0"])[0] == "1",
                 )
+                for row in rows:
+                    if row.get("status") == "created" and row.get("created"):
+                        vs_users.record_photo_activity(
+                            actor,
+                            "grid_created",
+                            f"{q.get('folder', [''])[0]}/{row.get('product', '')}/{row['created']}",
+                            {"source": row.get("source", "")},
+                        )
+                if q.get("delete", ["0"])[0] == "1":
+                    deleted_sources = {
+                        (row.get("product", ""), row.get("source", ""))
+                        for row in rows
+                        if row.get("status") == "created" and row.get("source")
+                    }
+                    for product, source_name in deleted_sources:
+                        vs_users.record_photo_activity(actor, "source_deleted_after_grid", f"{q.get('folder', [''])[0]}/{product}/{source_name}")
                 created = sum(1 for row in rows if row.get("status") == "created")
                 self.send_json({"rows": rows, "created": created, "issues": len(rows) - created})
                 return
             if route == "/api/organize-photos":
                 q = parse_qs(parsed.query)
+                actor = str((self.current_user() or {}).get("username", ""))
                 rows = organize_photos(
                     q.get("source", [""])[0],
                     q.get("destination", [""])[0],
                     q.get("move", ["0"])[0] == "1",
                 )
+                for row in rows:
+                    if row.get("status") in {"copied", "moved"} and row.get("target"):
+                        vs_users.record_photo_activity(actor, f"photo_{row['status']}", row["target"], {"source": row.get("file", "")})
                 changed = sum(1 for row in rows if row.get("status") in {"copied", "moved"})
                 self.send_json({"rows": rows, "changed": changed, "issues": len(rows) - changed})
                 return
@@ -2405,15 +2644,90 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/login":
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 fields = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
-                email = fields.get("email", [""])[0].strip()
+                username = fields.get("username", fields.get("email", [""]))[0].strip()
                 password = fields.get("password", [""])[0]
-                if hmac.compare_digest(email, LOGIN_EMAIL) and hmac.compare_digest(password, LOGIN_PASSWORD):
-                    self.send_redirect("/", {"Set-Cookie": f"vs_session={make_session_cookie()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400"})
+                code = fields.get("code", [""])[0]
+                user = vs_users.authenticate(username, password, code)
+                if user:
+                    vs_users.record_activity(str(user["username"]), "login", str(user["username"]))
+                    self.send_redirect("/", {"Set-Cookie": self.session_cookie_header(make_session_cookie(str(user["username"])))})
                 else:
-                    self.send_login("Wrong email or password.")
+                    self.send_login("Wrong username, password, or authenticator code.")
+                return
+            if route == "/api/password-reset/request":
+                payload = self.read_json_body()
+                if not _smtp_is_configured():
+                    self.send_json({"error": "Email recovery is not configured on the server yet. Ask an administrator to add the SMTP settings."}, 503)
+                    return
+                try:
+                    created = vs_users.create_password_reset(str(payload.get("email", "")))
+                except ValueError as exc:
+                    raise ValueError(str(exc)) from exc
+                if created:
+                    recipient, token = created
+                    try:
+                        _send_password_reset_email(recipient, token)
+                    except Exception as exc:
+                        vs_users.clear_password_reset(token)
+                        print(f"Password reset email failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+                        # Keep the same public response for a matching and a non-matching address.
+                self.send_json({"ok": True, "message": "If that email is connected to an account, a reset link will arrive shortly."})
+                return
+            if route == "/api/password-reset/complete":
+                payload = self.read_json_body()
+                vs_users.reset_password(str(payload.get("token", "")), str(payload.get("password", "")))
+                self.send_json({"ok": True})
                 return
             if not self.is_authenticated():
                 self.send_json({"error": "Login required."}, 401)
+                return
+            if route in {"/api/account/profile", "/api/account/totp", "/api/account/password", "/api/admin/users"}:
+                payload = self.read_json_body()
+                user = self.current_user() or {}
+                actor = str(user.get("username", ""))
+                if route == "/api/account/profile":
+                    vs_users.update_profile(actor, str(payload.get("first_name", "")), str(payload.get("last_name", "")), str(payload.get("email", "")))
+                    self.send_json({"ok": True})
+                    return
+                if route == "/api/account/totp":
+                    action = str(payload.get("action", ""))
+                    if action == "begin":
+                        self.send_json(vs_users.begin_totp_setup(actor))
+                        return
+                    if action == "enable":
+                        cookie_value = vs_users.enable_totp(actor, str(payload.get("password", "")), str(payload.get("code", "")))
+                    elif action == "disable":
+                        cookie_value = vs_users.disable_totp(actor, str(payload.get("password", "")), str(payload.get("code", "")))
+                    else:
+                        raise ValueError("Unsupported two-factor action.")
+                    self.send_json({"ok": True}, extra_headers={"Set-Cookie": self.session_cookie_header(cookie_value)})
+                    return
+                if route == "/api/account/password":
+                    cookie_value = vs_users.change_password(actor, str(payload.get("current_password", "")), str(payload.get("new_password", "")))
+                    self.send_json({"ok": True}, extra_headers={"Set-Cookie": self.session_cookie_header(cookie_value)})
+                    return
+                if user.get("role") != "admin":
+                    self.send_json({"error": "Administrator access required."}, 403)
+                    return
+                action = str(payload.get("action", ""))
+                target = str(payload.get("username", ""))
+                if action == "create":
+                    vs_users.admin_create_user(actor, target, str(payload.get("password", "")), str(payload.get("role", "user")), str(payload.get("first_name", "")), str(payload.get("last_name", "")), str(payload.get("email", "")))
+                elif action == "reset_password":
+                    if vs_users.normalize_username(target) == vs_users.normalize_username(actor):
+                        raise ValueError("Use Account to change your own password.")
+                    vs_users.admin_reset_password(actor, target, str(payload.get("password", "")))
+                elif action == "role":
+                    vs_users.admin_set_role(actor, target, str(payload.get("role", "")))
+                elif action == "profile":
+                    vs_users.admin_update_profile(actor, target, str(payload.get("first_name", "")), str(payload.get("last_name", "")), str(payload.get("email", "")))
+                elif action == "reset_2fa":
+                    vs_users.admin_reset_totp(actor, target)
+                elif action == "delete":
+                    vs_users.admin_delete_user(actor, target)
+                else:
+                    raise ValueError("Unsupported user-management action.")
+                self.send_json({"ok": True})
                 return
             if route == "/api/scan-riegel-logo":
                 length = int(self.headers.get("Content-Length", "0") or "0")
@@ -2690,7 +3004,8 @@ class Handler(BaseHTTPRequestHandler):
                         rows.append({"step": "upload", "file": filename, "status": "skipped", "message": "File type is not allowed"})
                         continue
                     target = destination / filename
-                    if target.exists() and not overwrite:
+                    existed_before = target.exists()
+                    if existed_before and not overwrite:
                         rows.append({"step": "upload", "file": filename, "status": "skipped", "path": str(target.relative_to(VS_ROOT)).replace(os.sep, "/"), "message": "File exists"})
                         continue
                     with target.open("wb") as out:
@@ -2703,6 +3018,7 @@ class Handler(BaseHTTPRequestHandler):
                         "step": "upload",
                         "file": filename,
                         "status": "uploaded",
+                        "overwritten": existed_before,
                         "path": str(target.relative_to(VS_ROOT)).replace(os.sep, "/"),
                         "url": public_url_for(target, cache_bust),
                     })
@@ -2728,6 +3044,11 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     rows.append({"step": "upload", "file": getattr(field, "filename", ""), "status": "error", "message": str(exc)})
             uploaded = sum(1 for row in rows if row.get("status") == "uploaded")
+            actor = str((self.current_user() or {}).get("username", ""))
+            for row in rows:
+                if row.get("status") == "uploaded" and row.get("path"):
+                    action = "photo_overwritten" if row.get("overwritten") else "photo_uploaded"
+                    vs_users.record_photo_activity(actor, action, str(row["path"]), {"file": row.get("file", "")})
             years_found = sum(1 for row in rows if row.get("status") == "year found")
             created = 0
             url_count = 0
@@ -2756,7 +3077,7 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 thread = threading.Thread(
                     target=run_upload_automation_job,
-                    args=(job_id, relative_parts, quantities, export_format, delete_source, cache_bust),
+                    args=(job_id, actor, relative_parts, quantities, export_format, delete_source, cache_bust),
                     daemon=True,
                 )
                 thread.start()
@@ -2772,6 +3093,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     if not VS_ROOT.exists():
         raise SystemExit(f"VS_ROOT does not exist: {VS_ROOT}")
+    vs_users.initialize()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"VS Tools serving on http://{HOST}:{PORT}")
     print(f"Scanning {VS_ROOT}")

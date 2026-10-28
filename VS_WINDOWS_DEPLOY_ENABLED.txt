@@ -1,0 +1,2 @@
+This marker enables the Windows server's pull-based deployment from origin/main.
+Commit this file together with the current dashboard code before relying on automatic updates.

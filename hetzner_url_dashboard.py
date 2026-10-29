@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import hmac
 import json
-import math
 import os
 import smtplib
 import sys
@@ -45,7 +44,6 @@ except Exception:
 VS_ROOT = Path(os.environ.get("VS_ROOT", "/var/www/primexeu.com.shared/photos/VS")).resolve()
 APP_ROOT = Path(__file__).resolve().parent
 ASSET_ROOT = Path(os.environ.get("VS_DASHBOARD_ASSET_ROOT", str(APP_ROOT / "static"))).resolve()
-USER_HOME = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or str(APP_ROOT))
 BASE_URL = os.environ.get("VS_BASE_URL", "https://primexeu.com/photos/VS/").rstrip("/") + "/"
 HOST = os.environ.get("VS_DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VS_DASHBOARD_PORT", "8791"))
@@ -53,14 +51,6 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 URL_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
 LOGO_SCAN_EXTENSIONS = IMAGE_EXTENSIONS | {".gif", ".bmp", ".tif", ".tiff", ".pjg"}
 YEAR_RE = re.compile(r"\b(?:16|17|18|19|20)\d{2}\b")
-RIEGEL_RE = re.compile(r"r\s*[i1l]\s*[e3]\s*g\s*[e3]\s*l", re.IGNORECASE)
-RIEGEL_REFERENCE_PATHS = [
-    USER_HOME / "Downloads" / "31s3VfcxY4L._AC_SL1500_.jpg",
-    Path(r"W:\05_CLIENTS\02_VS\10_DESIGN\01_WINE-SPIRITS\25_Riegel_V_PROJECT\ALL IMAGES"),
-]
-RIEGEL_REFERENCE_URLS = [
-    "https://m.media-amazon.com/images/I/31s3VfcxY4L._AC_SL1500_.jpg",
-]
 GENERATED_NAMES = {"1", "3", "6", "12", "12-alt", "12_alt"}
 GRID_LAYOUTS = {"1": (1, 1), "3": (3, 1), "6": (3, 2), "12": (6, 2), "12_alt": (4, 3)}
 GRID_OUTER_PADDING = 40
@@ -636,252 +626,11 @@ def detect_years_in_image(path: Path) -> dict[str, object]:
                 pass
 
 
-def normalize_logo_text(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", text.lower())
-
-
-def iter_riegel_reference_files() -> list[Path]:
-    files: list[Path] = []
-    configured = os.environ.get("RIEGEL_REFERENCE_PATHS", "")
-    paths = [Path(item.strip().strip('"')) for item in configured.split(";") if item.strip()]
-    paths.extend(RIEGEL_REFERENCE_PATHS)
-    for path in paths:
-        try:
-            if path.is_file() and path.suffix.lower() in LOGO_SCAN_EXTENSIONS:
-                files.append(path)
-            elif path.is_dir():
-                files.extend(local_logo_scan_files(str(path), recursive=True)[:40])
-        except Exception:
-            continue
-    cache_dir = Path(tempfile.gettempdir()) / "primex-riegel-references"
-    for index, url in enumerate(RIEGEL_REFERENCE_URLS, start=1):
-        try:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            parsed = urlparse(url)
-            suffix = Path(parsed.path).suffix.lower() or ".jpg"
-            target = cache_dir / f"reference-{index}{suffix}"
-            if not target.exists() or target.stat().st_size < 1000:
-                request = Request(url, headers={"User-Agent": "VS-Tools-Riegel-Logo-Scan/1.0"})
-                with urlopen(request, timeout=20) as response:
-                    target.write_bytes(response.read(5 * 1024 * 1024))
-            if target.exists() and target.suffix.lower() in LOGO_SCAN_EXTENSIONS:
-                files.append(target)
-        except Exception:
-            continue
-    unique: dict[str, Path] = {}
-    for path in files:
-        unique[str(path.resolve()).lower()] = path
-    return list(unique.values())[:60]
-
-
-def image_for_template(path: Path, width: int = 240):
-    with Image.open(path) as source:
-        img = ImageOps.grayscale(source.convert("RGB"))
-        img = ImageOps.autocontrast(img)
-        if img.width > width:
-            scale = width / img.width
-            img = img.resize((width, max(1, int(img.height * scale))), Image.Resampling.LANCZOS)
-        elif img.width < 120:
-            scale = 120 / img.width
-            img = img.resize((120, max(1, int(img.height * scale))), Image.Resampling.LANCZOS)
-        return img
-
-
-def template_crops(img) -> list[object]:
-    w, h = img.size
-    boxes = [
-        (0, 0, w, h),
-        (int(w * 0.2), int(h * 0.15), int(w * 0.8), int(h * 0.75)),
-        (int(w * 0.25), int(h * 0.2), int(w * 0.75), int(h * 0.62)),
-        (int(w * 0.28), int(h * 0.28), int(w * 0.72), int(h * 0.58)),
-    ]
-    crops = []
-    for box in boxes:
-        crop = img.crop(box)
-        if crop.width >= 24 and crop.height >= 14:
-            crops.append(crop)
-    return crops
-
-
-def normalized_template_score(candidate_img, template_img) -> float:
-    if np is None:
-        return normalized_template_score_pillow(candidate_img, template_img)
-    cand = np.asarray(candidate_img, dtype=np.float32)
-    tmpl = np.asarray(template_img, dtype=np.float32)
-    th, tw = tmpl.shape
-    ch, cw = cand.shape
-    if th > ch or tw > cw or th < 8 or tw < 8:
-        return 0.0
-    tmpl = tmpl - tmpl.mean()
-    tmpl_norm = float(np.sqrt((tmpl * tmpl).sum()))
-    if tmpl_norm < 1:
-        return 0.0
-    best = 0.0
-    step = max(4, min(th, tw) // 5)
-    for y in range(0, ch - th + 1, step):
-        for x in range(0, cw - tw + 1, step):
-            patch = cand[y:y + th, x:x + tw]
-            patch = patch - patch.mean()
-            patch_norm = float(np.sqrt((patch * patch).sum()))
-            if patch_norm < 1:
-                continue
-            score = float((patch * tmpl).sum() / (patch_norm * tmpl_norm))
-            if score > best:
-                best = score
-    return best
-
-
-def normalized_template_score_pillow(candidate_img, template_img) -> float:
-    candidate_img = candidate_img.convert("L")
-    template_img = template_img.convert("L")
-    tw, th = template_img.size
-    cw, ch = candidate_img.size
-    if th > ch or tw > cw or th < 8 or tw < 8:
-        return 0.0
-    tmpl_values = [float(v) for v in template_img.getdata()]
-    tmpl_mean = sum(tmpl_values) / len(tmpl_values)
-    tmpl_centered = [v - tmpl_mean for v in tmpl_values]
-    tmpl_norm = math.sqrt(sum(v * v for v in tmpl_centered))
-    if tmpl_norm < 1:
-        return 0.0
-    best = 0.0
-    step = max(4, min(th, tw) // 4)
-    for y in range(0, ch - th + 1, step):
-        for x in range(0, cw - tw + 1, step):
-            patch = candidate_img.crop((x, y, x + tw, y + th))
-            values = [float(v) for v in patch.getdata()]
-            mean = sum(values) / len(values)
-            centered = [v - mean for v in values]
-            norm = math.sqrt(sum(v * v for v in centered))
-            if norm < 1:
-                continue
-            score = sum(a * b for a, b in zip(centered, tmpl_centered)) / (norm * tmpl_norm)
-            if score > best:
-                best = score
-    return best
-
-
-def detect_riegel_reference_match(path: Path) -> dict[str, object]:
-    if Image is None:
-        return {"checked": False, "match": False, "score": 0.0, "message": "Visual reference scan needs Pillow."}
-    references = iter_riegel_reference_files()
-    if not references:
-        return {"checked": False, "match": False, "score": 0.0, "message": "No Riegel reference image found."}
-    try:
-        candidate = image_for_template(path, width=320)
-        best_score = 0.0
-        best_ref = ""
-        for ref in references:
-            try:
-                reference = image_for_template(ref, width=240)
-                for crop in template_crops(reference):
-                    for scale in (0.75, 1.0, 1.25):
-                        size = (max(8, int(crop.width * scale)), max(8, int(crop.height * scale)))
-                        template = crop.resize(size, Image.Resampling.LANCZOS)
-                        score = normalized_template_score(candidate, template)
-                        if score > best_score:
-                            best_score = score
-                            best_ref = str(ref)
-            except Exception:
-                continue
-        match = best_score >= 0.9
-        return {
-            "checked": True,
-            "match": match,
-            "score": round(best_score, 3),
-            "reference": best_ref,
-            "message": f"Visual reference match score {best_score:.3f}." if match else f"Best visual reference score {best_score:.3f}.",
-        }
-    except Exception as exc:
-        return {"checked": False, "match": False, "score": 0.0, "message": f"Visual reference scan failed: {exc}"}
-
-
-def merge_riegel_scan_results(ocr_result: dict[str, object], visual_result: dict[str, object]) -> dict[str, object]:
-    if visual_result.get("checked"):
-        merged = dict(visual_result)
-        if ocr_result.get("text"):
-            merged["text"] = ocr_result.get("text", "")
-        if visual_result.get("match"):
-            merged["message"] = f"Visual reference matched after OCR missed the text. {visual_result.get('message', '')}"
-        else:
-            merged["message"] = f"{ocr_result.get('message', '')} {visual_result.get('message', '')}".strip()
-        return merged
-    return ocr_result
-
-
 def detect_riegel_logo_in_image(path: Path) -> dict[str, object]:
     if path.suffix.lower() not in LOGO_SCAN_EXTENSIONS:
         return {"checked": False, "match": False, "message": "Logo scan only runs on image files."}
-    tesseract = shutil.which("tesseract")
-    if Image is None:
-        return {"checked": False, "match": False, "message": "Pillow is not installed on the server."}
-    if not tesseract:
-        return detect_riegel_reference_match(path)
-
-    variants: list[Path] = []
-    try:
-        with Image.open(path) as source:
-            image = source.convert("RGB")
-            max_width = 2200
-            if image.width < max_width:
-                scale = max_width / image.width
-                image = image.resize((max_width, int(image.height * scale)), Image.Resampling.LANCZOS)
-            gray = ImageOps.grayscale(image)
-            contrast = ImageOps.autocontrast(gray)
-            threshold_dark = contrast.point(lambda p: 255 if p > 145 else 0)
-            threshold_light = contrast.point(lambda p: 0 if p > 185 else 255)
-            variants_to_save = [
-                ("gray", contrast),
-                ("dark", threshold_dark),
-                ("light", threshold_light),
-            ]
-            for suffix, candidate in variants_to_save:
-                temp = tempfile.NamedTemporaryFile(delete=False, suffix=f"-riegel-{suffix}.png")
-                temp.close()
-                candidate.save(temp.name)
-                variants.append(Path(temp.name))
-
-        texts = []
-        for variant in variants:
-            for psm in ("6", "11"):
-                result = subprocess.run(
-                    [tesseract, str(variant), "stdout", "--psm", psm],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                if result.stdout:
-                    texts.append(result.stdout)
-        text = "\n".join(texts)
-        normalized = normalize_logo_text(text)
-        match = "riegel" in normalized or bool(RIEGEL_RE.search(text))
-        snippet = " ".join(text.split())
-        if len(snippet) > 260:
-            snippet = snippet[:257] + "..."
-        return {
-            "checked": True,
-            "match": match,
-            "text": snippet,
-            "message": "Riegel logo text detected." if match else "No Riegel logo text detected.",
-        } if match else merge_riegel_scan_results(
-            {"checked": True, "match": False, "text": snippet, "message": "No Riegel logo text detected."},
-            detect_riegel_reference_match(path),
-        )
-    except subprocess.TimeoutExpired:
-        return {"checked": False, "match": False, "message": "Riegel OCR timed out."}
-    except Exception as exc:
-        fallback = detect_riegel_reference_match(path)
-        if fallback.get("checked"):
-            fallback["message"] = f"OCR failed, used visual scan. {fallback.get('message', '')}"
-            return fallback
-        return {"checked": False, "match": False, "message": f"Riegel OCR failed: {exc}"}
-    finally:
-        for variant in variants:
-            try:
-                variant.unlink(missing_ok=True)
-            except Exception:
-                pass
+    from riegel_logo_detector import detect_logo
+    return detect_logo(path)
 
 
 def local_logo_scan_files(folder_text: str, recursive: bool) -> list[Path]:
@@ -938,6 +687,10 @@ def scan_riegel_sources(url_text: str, folder_text: str, recursive: bool) -> lis
                 "text": result.get("text", ""),
                 "score": result.get("score", ""),
                 "reference": result.get("reference", ""),
+                "position": result.get("position", ""),
+                "bbox": result.get("bbox", []),
+                "preview": result.get("preview", ""),
+                "method": result.get("method", ""),
             })
         except Exception as exc:
             rows.append({"source": "url", "file": Path(urlparse(url).path).name or url, "path": url, "url": url, "status": "error", "match": False, "message": str(exc)})
@@ -963,6 +716,10 @@ def scan_riegel_sources(url_text: str, folder_text: str, recursive: bool) -> lis
                     "text": result.get("text", ""),
                     "score": result.get("score", ""),
                     "reference": result.get("reference", ""),
+                "position": result.get("position", ""),
+                "bbox": result.get("bbox", []),
+                "preview": result.get("preview", ""),
+                "method": result.get("method", ""),
                 })
             except Exception as exc:
                 rows.append({"source": "folder", "file": path.name, "path": str(path), "status": "error", "match": False, "message": str(exc)})
@@ -989,6 +746,10 @@ def riegel_url_scan_row(url: str) -> dict[str, object]:
             "text": result.get("text", ""),
             "score": result.get("score", ""),
             "reference": result.get("reference", ""),
+                "position": result.get("position", ""),
+                "bbox": result.get("bbox", []),
+                "preview": result.get("preview", ""),
+                "method": result.get("method", ""),
         }
     except Exception as exc:
         return {"source": "url", "file": Path(urlparse(url).path).name or url, "path": url, "url": url, "status": "error", "match": False, "message": str(exc)}
@@ -1013,6 +774,10 @@ def riegel_file_scan_row(path: Path) -> dict[str, object]:
             "text": result.get("text", ""),
             "score": result.get("score", ""),
             "reference": result.get("reference", ""),
+                "position": result.get("position", ""),
+                "bbox": result.get("bbox", []),
+                "preview": result.get("preview", ""),
+                "method": result.get("method", ""),
         }
     except Exception as exc:
         return {"source": "folder", "file": path.name, "path": str(path), "status": "error", "match": False, "message": str(exc)}
@@ -2068,13 +1833,18 @@ GEWICHT_PAGE = """
 """
 
 
-RIEGEL_PAGE = """
+RIEGEL_PAGE = r"""
 <h1>Riegel Logo Scanner</h1>
-<p class="hint">Scan image URLs or a local/network folder for visible Riegel logo text. This report only identifies matches; it does not remove or edit images.</p>
+<p class="hint">Find the supplied Riegel bioweine logo in photos. Results show whether it appears, its pixel location, and an image preview with the match outlined. Photos are not edited.</p>
 <section class="panel">
+  <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:16px">
+    <img src="/assets/riegel-logo-reference.png" width="163" height="80" alt="Riegel bioweine reference logo" style="background:#fff;border:1px solid var(--line);border-radius:8px;object-fit:contain">
+    <p class="hint">The scanner searches for this exact mark and lettering, including light versions printed on dark bottles.</p>
+  </div>
   <div class="grid">
-    <div class="field full"><label>Image URLs</label><textarea id="riegelUrls" placeholder="Paste one image URL per line..."></textarea></div>
-    <div class="field full"><label>Folder path</label><input id="riegelFolder" placeholder="Example: C:\\Users\\Admin\\Downloads or W:\\05_CLIENTS\\02_VS\\10_DESIGN\\01_WINE-SPIRITS\\25_Riegel_V_PROJECT\\ALL IMAGES"></div>
+    <div class="field full"><label for="riegelFiles">Upload photos</label><input id="riegelFiles" type="file" accept=".jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff" multiple><span class="hint">Up to 20 images, 15 MB each.</span></div>
+    <div class="field full"><label for="riegelUrls">Image URLs</label><textarea id="riegelUrls" placeholder="Paste one image URL per line..."></textarea></div>
+    <div class="field full"><label for="riegelFolder">Folder path on the server</label><input id="riegelFolder" placeholder="Example: Y:\05_CLIENTS\02_VS\10_DESIGN\01_WINE-SPIRITS\25_Riegel_V_PROJECT\ALL IMAGES"></div>
     <div class="field full"><div class="checks"><label class="check"><input type="checkbox" id="riegelRecursive" checked> Include subfolders</label></div></div>
   </div>
   <div class="actions"><button id="riegelScanBtn">Scan for Riegel Logo</button><button class="mutedbtn" id="copyRiegelHitsBtn">Copy Found Paths / URLs</button><button class="mutedbtn" id="exportRiegelHitsBtn">Export Found CSV</button></div>
@@ -2177,11 +1947,89 @@ function setRiegelProgress(percent,label,active=false){const wrap=document.getEl
 function riegelHits(){return currentRows.filter(row=>row.match===true);}
 function updateRiegelCounts(){const scanned=document.getElementById("riegelScannedCount"); const found=document.getElementById("riegelFoundCount"); const errors=document.getElementById("riegelErrorCount"); if(scanned)scanned.textContent=String(currentRows.length); if(found)found.textContent=String(riegelHits().length); if(errors)errors.textContent=String(currentRows.filter(row=>["error","skipped"].includes(String(row.status||"").toLowerCase())).length);}
 async function parseJsonResponse(res){const text=await res.text(); try{return JSON.parse(text||"{}");}catch(err){throw new Error(text.trim().startsWith("<")?"Server returned HTML instead of JSON. Try again after refresh.":"Server returned invalid JSON.");}}
-async function pollRiegelJob(jobId){while(true){const data=await api(`/api/job?id=${encodeURIComponent(jobId)}`); currentRows=data.rows||[]; renderRiegelTable(); updateRiegelCounts(); setRiegelProgress(data.percent||15,data.message||"Scanning images...",!data.done); status(`${data.message||"Scanning images..."} Scanned ${data.scanned||currentRows.length||0}. Riegel found ${data.found||riegelHits().length}. Issues/skips ${data.issues||0}.`); if(data.done){if(!data.ok)throw new Error(data.message||"Riegel scan failed"); setRiegelProgress(100,"Finished.",false); renderRiegelTable(); updateRiegelCounts(); return data;} await new Promise(resolve=>setTimeout(resolve,1000));}}
-async function scanRiegelLogos(){const urls=document.getElementById("riegelUrls").value; const folder=document.getElementById("riegelFolder").value; const recursive=document.getElementById("riegelRecursive").checked; const btn=document.getElementById("riegelScanBtn"); if(!urls.trim()&&!folder.trim()){status("Paste image URLs or enter a folder path.");return;} if(btn)btn.disabled=true; currentRows=[]; renderRiegelTable(); updateRiegelCounts(); status("Starting Riegel scan..."); setRiegelProgress(8,"Starting scan...",true); try{const res=await fetch("/api/scan-riegel-logo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({urls,folder,recursive})}); const data=await parseJsonResponse(res); if(!res.ok)throw new Error(data.error||"Riegel scan failed"); if(data.job_id){await pollRiegelJob(data.job_id);return;} currentRows=data.rows||[]; renderRiegelTable(); updateRiegelCounts(); setRiegelProgress(100,"Finished.",false); status(`Scanned ${data.scanned} image(s). Riegel found in ${data.found}. Errors/skips: ${data.issues}.`);}finally{if(btn)btn.disabled=false;}}
-function renderRiegelTable(){const wrap=document.getElementById("tableWrap"); if(!wrap)return; if(!currentRows.length){wrap.textContent="No scan results.";return;} const rows=currentRows.slice(0,1200).map(row=>{const hit=row.match===true; const color=hit?"#b42318":(row.status==="error"?"#b42318":"#0f766e"); const link=row.url?`<a href="${row.url}" target="_blank">${row.url}</a>`:""; const evidence=row.score?`Score ${row.score}${row.reference?`<div class="hint">${row.reference}</div>`:""}`:(row.text||""); return `<tr><td>${row.source||""}</td><td>${row.file||""}</td><td><strong style="color:${color}">${row.status||""}</strong><div class="hint">${row.message||""}</div></td><td>${row.path||""}</td><td>${link}</td><td>${evidence}</td></tr>`;}).join(""); const note=currentRows.length>1200?`<p class="hint">Showing first 1200 of ${currentRows.length} rows.</p>`:""; wrap.innerHTML=`${note}<table><thead><tr><th>Source</th><th>File</th><th>Status</th><th>Path</th><th>URL</th><th>Evidence</th></tr></thead><tbody>${rows}</tbody></table>`;}
+async function pollRiegelJob(jobId,prefixRows=[]){
+  while(true){
+    const data=await api(`/api/job?id=${encodeURIComponent(jobId)}`);
+    currentRows=[...prefixRows,...(data.rows||[])];
+    renderRiegelTable(); updateRiegelCounts();
+    setRiegelProgress(data.percent||15,data.message||"Scanning images...",!data.done);
+    status(`${data.message||"Scanning images..."} Scanned ${currentRows.length}. Riegel found ${riegelHits().length}. Issues/skips ${currentRows.filter(row=>["error","skipped"].includes(row.status)).length}.`);
+    if(data.done){
+      if(!data.ok)throw new Error(data.message||"Riegel scan failed");
+      setRiegelProgress(100,"Finished.",false);
+      return data;
+    }
+    await new Promise(resolve=>setTimeout(resolve,1000));
+  }
+}
+async function scanRiegelLogos(){
+  const urls=document.getElementById("riegelUrls").value;
+  const folder=document.getElementById("riegelFolder").value;
+  const recursive=document.getElementById("riegelRecursive").checked;
+  const files=[...document.getElementById("riegelFiles").files];
+  const btn=document.getElementById("riegelScanBtn");
+  if(!urls.trim()&&!folder.trim()&&!files.length){status("Choose photos, paste image URLs, or enter a folder path.");return;}
+  if(files.length>20||files.some(file=>file.size>15*1024*1024)||files.reduce((n,file)=>n+file.size,0)>80*1024*1024){
+    status("Choose up to 20 photos, 15 MB each and 80 MB in total.");return;
+  }
+  if(btn)btn.disabled=true;
+  currentRows=[]; renderRiegelTable(); updateRiegelCounts();
+  setRiegelProgress(8,"Starting scan...",true);
+  try{
+    let uploaded=[];
+    if(files.length){
+      status(`Uploading and scanning ${files.length} photo(s)...`);
+      const form=new FormData();
+      files.forEach(file=>form.append("files",file));
+      const response=await fetch("/api/scan-riegel-logo/uploads",{method:"POST",body:form});
+      const data=await parseJsonResponse(response);
+      if(!response.ok)throw new Error(data.error||"Photo scan failed");
+      uploaded=data.rows||[];
+      currentRows=uploaded; renderRiegelTable(); updateRiegelCounts();
+      setRiegelProgress(45,`Scanned ${uploaded.length} uploaded photo(s).`,true);
+    }
+    if(urls.trim()||folder.trim()){
+      const response=await fetch("/api/scan-riegel-logo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({urls,folder,recursive})});
+      const data=await parseJsonResponse(response);
+      if(!response.ok)throw new Error(data.error||"Riegel scan failed");
+      if(data.job_id)await pollRiegelJob(data.job_id,uploaded);
+      else {currentRows=[...uploaded,...(data.rows||[])];renderRiegelTable();updateRiegelCounts();}
+    }
+    setRiegelProgress(100,"Finished.",false);
+    status(`Scanned ${currentRows.length} image(s). Supplied Riegel logo found in ${riegelHits().length}. Errors/skips: ${currentRows.filter(row=>["error","skipped"].includes(row.status)).length}.`);
+  }finally{if(btn)btn.disabled=false;}
+}
+function renderRiegelTable(){
+  const wrap=document.getElementById("tableWrap");
+  if(!wrap)return;
+  if(!currentRows.length){wrap.textContent="No scan results.";return;}
+  const rows=currentRows.slice(0,1200).map(row=>{
+    const hit=row.match===true;
+    const color=hit?"#b42318":(row.status==="error"?"#b42318":"#0f766e");
+    const url=String(row.url||"");
+    const link=/^https?:\/\//i.test(url)?`<a href="${escAttr(url)}" target="_blank" rel="noopener noreferrer">Open image</a>`:"";
+    const preview=hit&&row.preview?`<img src="${escAttr(row.preview)}" alt="Riegel logo location in ${escAttr(row.file||"image")}" style="max-width:180px;max-height:180px;object-fit:contain;border:1px solid var(--line);border-radius:6px">`:"";
+    const evidence=row.score?`${escAttr(row.method||"visual")} score ${escAttr(row.score)}`:(escAttr(row.text||""));
+    return `<tr><td>${escAttr(row.source||"")}</td><td>${escAttr(row.file||"")}</td><td><strong style="color:${color}">${escAttr(row.status||"")}</strong><div class="hint">${escAttr(row.message||"")}</div></td><td>${escAttr(row.position||"-")}</td><td>${preview}</td><td>${escAttr(row.path||"")}</td><td>${link}</td><td>${evidence}</td></tr>`;
+  }).join("");
+  const note=currentRows.length>1200?`<p class="hint">Showing first 1200 of ${currentRows.length} rows.</p>`:"";
+  wrap.innerHTML=`${note}<div style="overflow:auto"><table><thead><tr><th>Source</th><th>File</th><th>Status</th><th>Logo location</th><th>Preview</th><th>Path</th><th>URL</th><th>Evidence</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
 async function copyRiegelHits(){const hits=riegelHits().map(row=>row.url||row.path).filter(Boolean); if(!hits.length){status("No Riegel matches to copy.");return;} await navigator.clipboard.writeText([...new Set(hits)].join("\\n")); status(`Copied ${hits.length} Riegel match path(s)/URL(s).`);}
-function exportRiegelHits(){const hits=riegelHits(); if(!hits.length){status("No Riegel matches to export.");return;} const header=["source","file","status","path","url","message","score","reference","ocr_text"]; const lines=hits.map(row=>[row.source,row.file,row.status,row.path,row.url,row.message,row.score,row.reference,row.text].map(value=>`"${String(value||"").replace(/"/g,'""')}"`).join(",")); const blob=new Blob([[header.join(","),...lines].join("\\n")],{type:"text/csv"}); const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="riegel-logo-matches.csv"; a.click(); URL.revokeObjectURL(a.href); status(`Exported ${hits.length} Riegel match row(s).`);}
+function exportRiegelHits(){
+  const hits=riegelHits();
+  if(!hits.length){status("No Riegel matches to export.");return;}
+  const header=["source","file","status","path","url","position","x","y","width","height","score","method","message"];
+  const lines=hits.map(row=>{
+    const box=Array.isArray(row.bbox)?row.bbox:[];
+    return [row.source,row.file,row.status,row.path,row.url,row.position,box[0],box[1],box[2],box[3],row.score,row.method,row.message]
+      .map(value=>`"${String(value??"").replace(/"/g,'""')}"`).join(",");
+  });
+  const blob=new Blob([[header.join(","),...lines].join("\\n")],{type:"text/csv"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);a.download="riegel-logo-matches.csv";a.click();URL.revokeObjectURL(a.href);
+  status(`Exported ${hits.length} Riegel match row(s).`);
+}
 function renderUploadTable(){if(!currentRows.length){document.getElementById("tableWrap").textContent="No results.";return;} const rows=currentRows.slice(0,1000).map(row=>{const yearStyle=row.status==="year found"?' style="color:#b42318;font-weight:800"':""; return `<tr><td>${row.step||"upload"}</td><td>${row.file||row.product||""}</td><td${yearStyle}>${row.status||""}</td><td>${row.path||row.target||""}</td><td>${row.url?`<a href="${row.url}" target="_blank">${row.url}</a>`:(row.message||"")}</td></tr>`;}).join(""); document.getElementById("tableWrap").innerHTML=`<table><thead><tr><th>Step</th><th>File / Product</th><th>Status</th><th>Path</th><th>URL / Message</th></tr></thead><tbody>${rows}</tbody></table>`;}
 function uploadLinks(){const finalRows=currentRows.filter(row=>row.step==="url"&&row.url); const source=finalRows.length?finalRows:currentRows.filter(row=>row.url); return [...new Set(source.map(row=>row.url))].join("\\n");}
 async function copyUploadLinks(){const links=uploadLinks(); if(!links){status("No links to copy yet.");return;} await navigator.clipboard.writeText(links); status(`Copied ${links.split("\\n").length} links to clipboard.`);}
@@ -2422,7 +2270,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_asset(self, filename: str) -> bool:
         safe_name = Path(filename).name
-        if safe_name not in {"logo-vs.png", "logoprimexeu.png", "cmimetVisando.png"}:
+        if safe_name not in {"logo-vs.png", "logoprimexeu.png", "cmimetVisando.png", "riegel-logo-reference.png"}:
             return False
         path = ASSET_ROOT / safe_name
         if not path.exists() or not path.is_file():
@@ -2869,7 +2717,7 @@ class Handler(BaseHTTPRequestHandler):
                 thread.start()
                 self.send_json({"job_id": job_id, "done": False})
                 return
-            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon", "/api/variacionet", "/api/image-converter", "/api/image-resizer", "/api/database/pricing", "/api/database/sku", "/api/database/import", "/api/vk-prices/preview", "/api/vk-prices/update"}:
+            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon", "/api/variacionet", "/api/image-converter", "/api/image-resizer", "/api/database/pricing", "/api/database/sku", "/api/database/import", "/api/vk-prices/preview", "/api/vk-prices/update", "/api/scan-riegel-logo/uploads"}:
                 self.send_json({"error": "Not found"}, 404)
                 return
             content_type = self.headers.get("Content-Type", "")
@@ -2879,6 +2727,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Image upload is larger than 25 MB.")
             if route.startswith("/api/vk-prices/") and int(self.headers.get("Content-Length", "0") or "0") > 26 * 1024 * 1024:
                 raise ValueError("Workbook upload is larger than 25 MB.")
+            if route == "/api/scan-riegel-logo/uploads" and int(self.headers.get("Content-Length", "0") or "0") > 80 * 1024 * 1024:
+                raise ValueError("Selected images are larger than 80 MB in total.")
             form = cgi.FieldStorage(
                 fp=self.rfile,
                 headers=self.headers,
@@ -2888,6 +2738,33 @@ class Handler(BaseHTTPRequestHandler):
                     "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
                 },
             )
+            if route == "/api/scan-riegel-logo/uploads":
+                fields = form["files"] if "files" in form else []
+                if not isinstance(fields, list):
+                    fields = [fields]
+                if not fields or len(fields) > 20:
+                    raise ValueError("Choose 1 to 20 image files.")
+                rows = []
+                for field in fields:
+                    filename = safe_upload_filename(getattr(field, "filename", ""))
+                    suffix = Path(filename).suffix.lower()
+                    if suffix not in LOGO_SCAN_EXTENSIONS:
+                        raise ValueError(f"Unsupported image format: {filename}")
+                    data = field.file.read(15 * 1024 * 1024 + 1)
+                    if len(data) > 15 * 1024 * 1024:
+                        raise ValueError(f"Image is larger than 15 MB: {filename}")
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
+                        temporary.write(data)
+                        temporary_path = Path(temporary.name)
+                    try:
+                        row = riegel_file_scan_row(temporary_path)
+                        row.update(source="upload", file=filename, path=filename)
+                        rows.append(row)
+                    finally:
+                        temporary_path.unlink(missing_ok=True)
+                self.send_json({"rows": rows, "scanned": len(rows), "found": sum(row["match"] for row in rows),
+                                "issues": sum(row["status"] in {"error", "skipped"} for row in rows)})
+                return
             if route in {"/api/vk-prices/preview", "/api/vk-prices/update"}:
                 from vk_price_updater import XLSM_MIME, XLSX_MIME, scan_workbook
 

@@ -7,3 +7,4 @@ openpyxl
 requests
 selenium
 xlrd
+opencv-python-headless>=4.10,<6

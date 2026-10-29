@@ -1780,6 +1780,7 @@ def shell(title: str, active: str, main: str) -> bytes:
         <a class="{'active' if active == 'converter' else ''}" href="/image-converter">{icons['grid']}<span>Image Converter</span></a>
         <a class="{'active' if active == 'resizer' else ''}" href="/image-resizer">{icons['grid']}<span>Image Resizer</span></a>
         <a class="{'active' if active == 'database' else ''}" href="/database-project">{icons['database']}<span>Database Project</span></a>
+        <a class="{'active' if active == 'vk-prices' else ''}" href="/vk-price-updater">{icons['excel']}<span>VK Price Updater</span></a>
       </nav>
       <a class="account-nav {'active' if active == 'account' else ''}" href="/account" aria-label="Account and profile"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M5 20a7 7 0 0 1 14 0"></path><circle cx="12" cy="12" r="10"></circle></svg><span>Account &amp; profile</span></a>
       <a class="logout" href="/logout">Sign out</a>
@@ -2556,6 +2557,10 @@ class Handler(BaseHTTPRequestHandler):
                 from database_project import PAGE
                 self.send_html(shell("Database Project", "database", PAGE))
                 return
+            if route == "/vk-price-updater":
+                from vk_price_updater import PAGE
+                self.send_html(shell("VK Price Updater", "vk-prices", PAGE))
+                return
             if route == "/api/database/status":
                 from database_project import table_status
                 self.send_json(table_status())
@@ -2864,7 +2869,7 @@ class Handler(BaseHTTPRequestHandler):
                 thread.start()
                 self.send_json({"job_id": job_id, "done": False})
                 return
-            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon", "/api/variacionet", "/api/image-converter", "/api/image-resizer", "/api/database/pricing", "/api/database/sku", "/api/database/import"}:
+            if route not in {"/api/upload", "/api/fill-excel", "/api/gewicht", "/api/find-url-amazon", "/api/variacionet", "/api/image-converter", "/api/image-resizer", "/api/database/pricing", "/api/database/sku", "/api/database/import", "/api/vk-prices/preview", "/api/vk-prices/update"}:
                 self.send_json({"error": "Not found"}, 404)
                 return
             content_type = self.headers.get("Content-Type", "")
@@ -2872,6 +2877,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Expected multipart upload.")
             if route in {"/api/image-converter", "/api/image-resizer"} and int(self.headers.get("Content-Length", "0") or "0") > 26 * 1024 * 1024:
                 raise ValueError("Image upload is larger than 25 MB.")
+            if route.startswith("/api/vk-prices/") and int(self.headers.get("Content-Length", "0") or "0") > 26 * 1024 * 1024:
+                raise ValueError("Workbook upload is larger than 25 MB.")
             form = cgi.FieldStorage(
                 fp=self.rfile,
                 headers=self.headers,
@@ -2881,6 +2888,31 @@ class Handler(BaseHTTPRequestHandler):
                     "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
                 },
             )
+            if route in {"/api/vk-prices/preview", "/api/vk-prices/update"}:
+                from vk_price_updater import XLSM_MIME, XLSX_MIME, scan_workbook
+
+                field = form["file"] if "file" in form else None
+                if field is None or not getattr(field, "filename", ""):
+                    raise ValueError("Choose an .xlsx or .xlsm workbook.")
+                filename = safe_upload_filename(field.filename)
+                data = field.file.read(25 * 1024 * 1024 + 1)
+                apply = route.endswith("/update")
+                result, updated = scan_workbook(data, filename, apply=apply)
+                if not apply:
+                    self.send_json(result.as_dict())
+                    return
+                assert updated is not None
+                output_name = "VK_PRICES_UPDATED" + Path(filename).suffix.lower()
+                self.send_response(200)
+                self.send_header("Content-Type", XLSM_MIME if output_name.endswith(".xlsm") else XLSX_MIME)
+                self.send_header("Content-Disposition", f'attachment; filename="{output_name}"')
+                self.send_header("X-VK-Changes", str(result.changes))
+                self.send_header("Content-Length", str(len(updated)))
+                self.end_headers()
+                self.wfile.write(updated)
+                actor = str((self.current_user() or {}).get("username", ""))
+                vs_users.record_activity(actor, "vk_prices_updated", filename, {"changes": result.changes})
+                return
             if route.startswith("/api/database/"):
                 from database_project import XLSX_MIME, import_table, pricing_report, sku_report
                 field = form["file"] if "file" in form else None

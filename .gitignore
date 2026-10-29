@@ -25,3 +25,7 @@ logs/avatars/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local VS Tools runtime logs
+logs/vs-tools.*.log
+logs/*.sqlite3*

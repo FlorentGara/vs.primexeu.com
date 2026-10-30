@@ -2686,7 +2686,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if route == "/black-background-scanner":
                 from black_background_scanner import PAGE
-                self.send_html(shell("Black Background Scanner", "black", PAGE))
+                self.send_html(shell("Black Background Scanner", "black", PAGE.replace("__VS_ROOT__", html.escape(str(VS_ROOT)))))
                 return
             if route == "/database-project":
                 from database_project import PAGE
@@ -3261,8 +3261,10 @@ class Handler(BaseHTTPRequestHandler):
                         items.append({"source": "url", "file": Path(urlparse(url).path).name or url, "url": url})
                     folder = form.getfirst("folder", "").strip()
                     if folder:
-                        files = local_image_files(folder, form.getfirst("recursive", "1") == "1")
-                        items.extend({"source": "folder", "file": path.name, "path": str(path)} for path in files[:2000])
+                        files = local_image_files(folder, form.getfirst("recursive", "1") == "1", VS_ROOT)
+                        if not files:
+                            raise ValueError(f"No supported images found in {folder}. Supported formats: {', '.join(sorted(IMAGE_EXTENSIONS))}.")
+                        items.extend({"source": "folder", "file": path.name, "path": str(path)} for path in files)
                     if not items:
                         raise ValueError("Choose photos, URLs, or a folder to scan.")
                 except Exception:

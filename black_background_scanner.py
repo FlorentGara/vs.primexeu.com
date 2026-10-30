@@ -16,10 +16,16 @@ from PIL import Image, ImageOps
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".pjg"}
 
 
-def local_image_files(folder_text: str, recursive: bool) -> list[Path]:
+def local_image_files(folder_text: str, recursive: bool, root: Path | None = None) -> list[Path]:
     folder = Path(folder_text.strip().strip('"'))
+    if not folder.is_absolute() and root is not None:
+        folder = root / folder
     if not folder.is_dir():
-        raise ValueError("Folder does not exist or is not a folder.")
+        location = f" Server photos root: {root}." if root is not None else ""
+        raise ValueError(
+            f"Folder is not accessible from this server: {folder}."
+            f" Use a folder on the server or upload the photos.{location}"
+        )
     paths = folder.rglob("*") if recursive else folder.iterdir()
     return sorted(
         (path for path in paths if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS),
@@ -331,7 +337,7 @@ PAGE = r"""
   <div class="grid">
     <div class="field full"><label for="blackFiles">Upload photos</label><input id="blackFiles" type="file" accept=".jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff" multiple><span class="hint">Up to 20 photos, 15 MB each.</span></div>
     <div class="field full"><label for="blackUrls">Image URLs</label><textarea id="blackUrls" placeholder="One URL per line"></textarea></div>
-    <div class="field full"><label for="blackFolder">Folder on server</label><input id="blackFolder" placeholder="Enter folder path"></div>
+    <div class="field full"><label for="blackFolder">Folder on server</label><input id="blackFolder" placeholder="Enter a folder path on the server"><span class="hint">Enter a full server path or a folder name inside __VS_ROOT__. For photos on your computer, use Upload photos.</span></div>
     <div class="field full"><label class="check"><input type="checkbox" id="blackRecursive" checked> Include subfolders</label></div>
   </div>
   <div class="actions"><button id="blackScanBtn" type="button">Scan photos</button><button id="blackConvertAllBtn" class="mutedbtn" type="button" disabled>Convert All to White &amp; Download ZIP</button><button id="blackTransparentAllBtn" class="mutedbtn" type="button" disabled>Remove Background (Transparent PNG) &amp; Download ZIP</button><button id="blackCopyBtn" class="mutedbtn" type="button">Copy black background paths / URLs</button><button id="blackExportBtn" class="mutedbtn" type="button">Export CSV</button></div>

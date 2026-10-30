@@ -2686,7 +2686,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if route == "/black-background-scanner":
                 from black_background_scanner import PAGE
-                self.send_html(shell("Black Background Scanner", "black", PAGE.replace("__VS_ROOT__", html.escape(str(VS_ROOT)))))
+                self.send_html(shell("Black Background Scanner", "black", PAGE))
                 return
             if route == "/database-project":
                 from database_project import PAGE
@@ -3196,16 +3196,6 @@ class Handler(BaseHTTPRequestHandler):
                             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
                                 temporary.write(data)
                                 items.append({"source": "upload", "file": filename, "path": temporary.name})
-                        elif source == "folder":
-                            path = Path(str(entry.get("path", "")))
-                            if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
-                                raise ValueError(f"Image path is unavailable: {path}")
-                            items.append({"source": "folder", "file": path.name, "path": str(path)})
-                        elif source == "url":
-                            url = str(entry.get("url", ""))
-                            if not url.lower().startswith(("http://", "https://")):
-                                raise ValueError("Only http/https image URLs are supported.")
-                            items.append({"source": "url", "file": Path(urlparse(url).path).name or "image.jpg", "url": url})
                         else:
                             raise ValueError("Invalid photo source in batch.")
                 except Exception:
@@ -3227,7 +3217,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"job_id": job_id, "count": len(items)})
                 return
             if route == "/api/scan-black-background":
-                from black_background_scanner import IMAGE_EXTENSIONS, local_image_files
+                from black_background_scanner import IMAGE_EXTENSIONS
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 content_type = self.headers.get("Content-Type", "")
                 if not content_type.startswith("multipart/form-data") or length > 82 * 1024 * 1024:
@@ -3254,19 +3244,8 @@ class Handler(BaseHTTPRequestHandler):
                         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
                             temporary.write(data)
                             items.append({"source": "upload", "file": filename, "path": temporary.name, "display_path": filename, "uploadIndex": upload_index})
-                    urls = [line.strip() for line in re.split(r"[\r\n]+", form.getfirst("urls", "")) if line.strip()]
-                    for url in dict.fromkeys(urls[:1000]):
-                        if not url.lower().startswith(("http://", "https://")):
-                            raise ValueError("Only http/https image URLs are supported.")
-                        items.append({"source": "url", "file": Path(urlparse(url).path).name or url, "url": url})
-                    folder = form.getfirst("folder", "").strip()
-                    if folder:
-                        files = local_image_files(folder, form.getfirst("recursive", "1") == "1", VS_ROOT)
-                        if not files:
-                            raise ValueError(f"No supported images found in {folder}. Supported formats: {', '.join(sorted(IMAGE_EXTENSIONS))}.")
-                        items.extend({"source": "folder", "file": path.name, "path": str(path)} for path in files)
                     if not items:
-                        raise ValueError("Choose photos, URLs, or a folder to scan.")
+                        raise ValueError("Choose photos to scan.")
                 except Exception:
                     for item in items:
                         if item["source"] == "upload":

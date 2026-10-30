@@ -16,23 +16,6 @@ from PIL import Image, ImageOps
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".pjg"}
 
 
-def local_image_files(folder_text: str, recursive: bool, root: Path | None = None) -> list[Path]:
-    folder = Path(folder_text.strip().strip('"'))
-    if not folder.is_absolute() and root is not None:
-        folder = root / folder
-    if not folder.is_dir():
-        location = f" Server photos root: {root}." if root is not None else ""
-        raise ValueError(
-            f"Folder is not accessible from this server: {folder}."
-            f" Use a folder on the server or upload the photos.{location}"
-        )
-    paths = folder.rglob("*") if recursive else folder.iterdir()
-    return sorted(
-        (path for path in paths if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS),
-        key=lambda path: str(path).lower(),
-    )
-
-
 def download_image(url: str) -> Path:
     if not url.lower().startswith(("http://", "https://")):
         raise ValueError("Only http/https image URLs are supported.")
@@ -336,11 +319,8 @@ PAGE = r"""
 <section class="panel">
   <div class="grid">
     <div class="field full"><label for="blackFiles">Upload photos</label><input id="blackFiles" type="file" accept=".jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff" multiple><span class="hint">Up to 20 photos, 15 MB each.</span></div>
-    <div class="field full"><label for="blackUrls">Image URLs</label><textarea id="blackUrls" placeholder="One URL per line"></textarea></div>
-    <div class="field full"><label for="blackFolder">Folder on server</label><input id="blackFolder" placeholder="Enter a folder path on the server"><span class="hint">Enter a full server path or a folder name inside __VS_ROOT__. For photos on your computer, use Upload photos.</span></div>
-    <div class="field full"><label class="check"><input type="checkbox" id="blackRecursive" checked> Include subfolders</label></div>
   </div>
-  <div class="actions"><button id="blackScanBtn" type="button">Scan photos</button><button id="blackConvertAllBtn" class="mutedbtn" type="button" disabled>Convert All to White &amp; Download ZIP</button><button id="blackTransparentAllBtn" class="mutedbtn" type="button" disabled>Remove Background (Transparent PNG) &amp; Download ZIP</button><button id="blackCopyBtn" class="mutedbtn" type="button">Copy black background paths / URLs</button><button id="blackExportBtn" class="mutedbtn" type="button">Export CSV</button></div>
+  <div class="actions"><button id="blackScanBtn" type="button">Scan photos</button><button id="blackConvertAllBtn" class="mutedbtn" type="button" disabled>Convert All to White &amp; Download ZIP</button><button id="blackTransparentAllBtn" class="mutedbtn" type="button" disabled>Remove Background (Transparent PNG) &amp; Download ZIP</button><button id="blackExportBtn" class="mutedbtn" type="button">Export CSV</button></div>
   <div class="progress" id="blackProgress"><div class="track"><div class="bar" id="blackProgressBar"></div></div><div class="label" id="blackProgressLabel">Waiting...</div></div>
   <div class="status" id="status"></div>
 </section>
@@ -370,11 +350,10 @@ PAGE = r"""
     if (!shown.length) { byId("blackResults").textContent="No scan results yet."; return; }
     const body=shown.map(row=>{
       const preview=row.preview?'<img src="'+escapeHtml(row.preview)+'" alt="Preview" style="max-width:120px;max-height:120px;object-fit:contain">':"";
-      const link=row.url?'<a href="'+escapeHtml(row.url)+'" target="_blank" rel="noopener noreferrer">Open image</a>':"";
-      return '<tr><td>'+escapeHtml(row.file)+'</td><td>'+escapeHtml(row.status)+'</td><td>'+escapeHtml(row.dark_percent ?? "-")+'%</td><td>'+preview+'</td><td>'+escapeHtml(row.path || "")+'</td><td>'+link+'</td><td>'+escapeHtml(row.message || "")+'</td></tr>';
+      return '<tr><td>'+escapeHtml(row.file)+'</td><td>'+escapeHtml(row.status)+'</td><td>'+escapeHtml(row.dark_percent ?? "-")+'%</td><td>'+preview+'</td><td>'+escapeHtml(row.message || "")+'</td></tr>';
     }).join("");
     const note=rows.length>shown.length?'<p class="hint">Showing the first 1200 of '+rows.length+'.</p>':"";
-    byId("blackResults").innerHTML=note+'<div style="overflow:auto"><table><thead><tr><th>Image</th><th>Result</th><th>Dark border</th><th>Preview</th><th>Path</th><th>URL</th><th>Details</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+    byId("blackResults").innerHTML=note+'<div style="overflow:auto"><table><thead><tr><th>Image</th><th>Result</th><th>Dark border</th><th>Preview</th><th>Details</th></tr></thead><tbody>'+body+'</tbody></table></div>';
   }
   function progress(percent,label,active) {
     const wrap=byId("blackProgress");
@@ -383,12 +362,11 @@ PAGE = r"""
     byId("blackProgressLabel").textContent=label;
   }
   byId("blackScanBtn").addEventListener("click",async()=>{
-    const files=[...byId("blackFiles").files], urls=byId("blackUrls").value, folder=byId("blackFolder").value;
-    if (!files.length && !urls.trim() && !folder.trim()) { message("Choose photos, enter URLs, or enter a folder path."); return; }
+    const files=[...byId("blackFiles").files];
+    if (!files.length) { message("Choose photos to scan."); return; }
     if (files.length>20 || files.some(file=>file.size>15*1024*1024) || files.reduce((n,file)=>n+file.size,0)>80*1024*1024) { message("Choose up to 20 photos, 15 MB each and 80 MB total."); return; }
     const form=new FormData();
     files.forEach(file=>form.append("files",file));
-    form.append("urls",urls); form.append("folder",folder); form.append("recursive",byId("blackRecursive").checked?"1":"0");
     byId("blackScanBtn").disabled=true; uploadedFiles=files; scanReady=false; rows=[]; render(); progress(3,"Starting scan...",true);
     try {
       const response=await fetch("/api/scan-black-background",{method:"POST",body:form});
@@ -410,7 +388,7 @@ PAGE = r"""
     const targets=background==="transparent"?rows.filter(row=>row.status!=="error"):rows.filter(row=>row.match===true);
     if (!targets.length) { message(background==="transparent"?"No photos to process.":"No black background photos to convert."); return; }
     const form=new FormData();
-    form.append("manifest",JSON.stringify(targets.map(row=>({source:row.source,path:row.path,url:row.url,uploadIndex:row.uploadIndex}))));
+    form.append("manifest",JSON.stringify(targets.map(row=>({source:"upload",uploadIndex:row.uploadIndex}))));
     form.append("background",background);
     const appended=new Set();
     for (const row of targets) {
@@ -446,14 +424,8 @@ PAGE = r"""
   };
   byId("blackConvertAllBtn").addEventListener("click",()=>convertAll("white"));
   byId("blackTransparentAllBtn").addEventListener("click",()=>convertAll("transparent"));
-  byId("blackCopyBtn").addEventListener("click",async()=>{
-    const paths=rows.filter(row=>row.match).map(row=>row.url || row.path).filter(Boolean);
-    if (!paths.length) { message("No black background photos to copy."); return; }
-    try { await navigator.clipboard.writeText(paths.join("\n")); message("Copied "+paths.length+" paths/URLs."); }
-    catch(error) { message("Browser blocked copying to clipboard."); }
-  });
   byId("blackExportBtn").addEventListener("click",()=>{
-    const header=["source","file","status","dark_percent","path","url","message"];
+    const header=["source","file","status","dark_percent","message"];
     const csv=[header.join(","),...rows.map(row=>header.map(key=>'"'+String(row[key] ?? "").replace(/"/g,'""')+'"').join(","))].join("\r\n");
     const link=document.createElement("a"); link.href=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));
     link.download="black-background-results.csv"; link.click(); setTimeout(()=>URL.revokeObjectURL(link.href),1000);

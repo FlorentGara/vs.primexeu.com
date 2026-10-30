@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import hetzner_url_dashboard as app
-from black_background_scanner import scan_image, replace_black_background
+from black_background_scanner import scan_image, replace_black_background, remove_background
 
 
 class AuthenticatedHandler(app.Handler):
@@ -105,6 +105,114 @@ class BlackBackgroundTests(unittest.TestCase):
                 self.assertEqual(cleaned.getpixel((0, 0)), (255, 255, 255))
                 self.assertLess(max(cleaned.getpixel((120, 75))), 90)
                 self.assertEqual(cleaned.getpixel((120, 175)), (220, 210, 190))
+            transparent, _ = replace_black_background(path, "transparent")
+            with Image.open(BytesIO(transparent)) as cutout:
+                self.assertEqual(cutout.getpixel((0, 0))[3], 0)
+                self.assertEqual(cutout.getpixel((80, 150)), (48, 48, 48, 255))
+    def test_transparent_png_has_clear_background_and_opaque_product(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "black.png"
+            path.write_bytes(photo_bytes("black", "white"))
+            data, _ = replace_black_background(path, "transparent")
+            with Image.open(BytesIO(data)) as converted:
+                self.assertEqual(converted.mode, "RGBA")
+                self.assertEqual(converted.getpixel((0, 0))[3], 0)
+                self.assertEqual(converted.getpixel((100, 100))[3], 255)
+
+    def test_transparent_removal_includes_white_background_and_label(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "white.png"
+            image = Image.new("RGB", (200, 200), "white")
+            draw = ImageDraw.Draw(image)
+            draw.ellipse((55, 35, 145, 165), fill=(30, 40, 50))
+            draw.rectangle((68, 85, 132, 115), fill="white")
+            image.save(path)
+            original = path.read_bytes()
+            data, detection = remove_background(path)
+            self.assertFalse(detection["match"])
+            with Image.open(BytesIO(data)) as converted:
+                self.assertEqual(converted.mode, "RGBA")
+                self.assertEqual(converted.getpixel((0, 0))[3], 0)
+                self.assertEqual(converted.getpixel((100, 60)), (30, 40, 50, 255))
+                self.assertEqual(converted.getpixel((100, 100)), (255, 255, 255, 255))
+            self.assertEqual(path.read_bytes(), original)
+    def test_transparent_batch_includes_black_and_white_background_photos(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            black = folder / "black.png"
+            white = folder / "white.png"
+            black.write_bytes(photo_bytes("black", "white"))
+            white.write_bytes(photo_bytes("white", "black"))
+            job_id = "mixed-background-test"
+            app.JOBS[job_id] = {"kind": "black_background_batch", "done": False}
+            try:
+                app.run_black_background_convert_batch(job_id, [
+                    {"source": "folder", "file": black.name, "path": str(black)},
+                    {"source": "folder", "file": white.name, "path": str(white)},
+                ], "transparent")
+                job = app.JOBS[job_id]
+                self.assertTrue(job["ok"], job["message"])
+                self.assertEqual(job["created"], 2)
+                with zipfile.ZipFile(job["output_path"]) as archive:
+                    names = archive.namelist()
+                    self.assertEqual(len(names), 2)
+                    for name in names:
+                        with Image.open(BytesIO(archive.read(name))) as converted:
+                            self.assertEqual(converted.mode, "RGBA")
+                            self.assertEqual(converted.getpixel((0, 0))[3], 0)
+                            self.assertEqual(converted.getpixel((100, 100))[3], 255)
+            finally:
+                job = app.JOBS.pop(job_id)
+                if job.get("output_path"):
+                    Path(job["output_path"]).unlink(missing_ok=True)
+    def test_transparent_batch_download_uses_selected_mode(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), AuthenticatedHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        job_id = None
+        try:
+            root = f"http://127.0.0.1:{server.server_address[1]}"
+            source = photo_bytes("black", "white")
+            manifest = json.dumps([{"source": "upload", "uploadIndex": 0}])
+            boundary = "transparent-batch-test-boundary"
+            body = (
+                f'--{boundary}\r\nContent-Disposition: form-data; name="background"\r\n\r\ntransparent\r\n'
+                f'--{boundary}\r\nContent-Disposition: form-data; name="manifest"\r\n\r\n{manifest}\r\n'
+                f'--{boundary}\r\nContent-Disposition: form-data; name="upload_0"; filename="black.png"\r\n'
+                f'Content-Type: image/png\r\n\r\n'
+            ).encode() + source + f'\r\n--{boundary}--\r\n'.encode()
+            request = Request(
+                root + "/api/scan-black-background/convert-all", data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST",
+            )
+            with urlopen(request, timeout=10) as response:
+                job_id = json.load(response)["job_id"]
+            for _ in range(50):
+                with urlopen(root + "/api/job?id=" + job_id, timeout=10) as response:
+                    state = json.load(response)
+                if state["done"]:
+                    break
+                time.sleep(0.1)
+            self.assertTrue(state["ok"], state["message"])
+            self.assertEqual(state["created"], 1)
+            with urlopen(root + "/api/scan-black-background/convert-all/download?id=" + job_id) as response:
+                self.assertIn("Transparent_Background.zip", response.headers["Content-Disposition"])
+                archive_bytes = response.read()
+            with zipfile.ZipFile(BytesIO(archive_bytes)) as archive:
+                self.assertEqual(archive.namelist(), ["Transparent_Background/black-transparent-background.png"])
+                with Image.open(BytesIO(archive.read(archive.namelist()[0]))) as converted:
+                    self.assertEqual(converted.mode, "RGBA")
+                    self.assertEqual(converted.getpixel((0, 0))[3], 0)
+                    self.assertEqual(converted.getpixel((100, 100))[3], 255)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            if job_id:
+                job = app.JOBS.pop(job_id, {})
+                output = job.get("output_path")
+                if output:
+                    Path(output).unlink(missing_ok=True)
     def test_convert_all_zip_contains_upload_folder_and_url(self):
         class QuietFiles(SimpleHTTPRequestHandler):
             def log_message(self, *_args):
@@ -190,6 +298,7 @@ class BlackBackgroundTests(unittest.TestCase):
                 page = response.read().decode()
             self.assertIn("Black Background Scanner", page)
             self.assertIn('href="/black-background-scanner"', page)
+            self.assertIn('id="blackTransparentAllBtn"', page)
             boundary = "black-background-test-boundary"
             parts = []
             for name, background, center in (

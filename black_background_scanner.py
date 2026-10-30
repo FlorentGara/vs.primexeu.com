@@ -82,9 +82,11 @@ def scan_image(path: Path) -> dict[str, object]:
 
 
 
-def replace_black_background(path: Path) -> tuple[bytes, dict[str, object]]:
-    """Return a PNG copy with border-connected dark background replaced by white."""
+def replace_black_background(path: Path, background: str = "white") -> tuple[bytes, dict[str, object]]:
+    """Return a PNG copy with the detected black background replaced or removed."""
     import cv2
+    if background not in {"white", "transparent"}:
+        raise ValueError("Background must be white or transparent.")
 
     detection = scan_image(path)
     if not detection["match"]:
@@ -189,17 +191,142 @@ def replace_black_background(path: Path) -> tuple[bytes, dict[str, object]]:
     edge_band = ((near_background & near_foreground) | (dark_fringe & wide_band)) & (denominator > 400)
     estimated_background = 1 - np.clip(numerator / np.maximum(denominator, 1), 0, 1)
     alpha[edge_band] = estimated_background[edge_band]
-    cleaned = rgb.astype(np.float32)
-    for channel in range(3):
-        cleaned[:, :, channel] += alpha * (255 - background_color[channel])
-    cleaned = np.clip(cleaned, 0, 255).astype(np.uint8)
+    local_median = cv2.medianBlur(rgb, 5)
+    brightness = np.max(rgb, axis=2)
+    median_brightness = np.max(local_median, axis=2)
+    stable_dark_product = (
+        (brightness > np.max(background_color) + 30)
+        & (median_brightness > np.max(background_color) + 30)
+        & (brightness <= 110)
+        & (median_brightness <= 110)
+        & (np.max(np.abs(rgb.astype(np.int16) - local_median.astype(np.int16)), axis=2) <= 12)
+    )
+    _, dark_components, dark_stats, _ = cv2.connectedComponentsWithStats(
+        stable_dark_product.astype(np.uint8), connectivity=8,
+    )
+    substantial = dark_stats[:, cv2.CC_STAT_AREA] >= max(64, round(height * width * 0.01))
+    substantial[0] = False
+    alpha[edge_band & substantial[dark_components]] = 0
+    if background == "white":
+        cleaned = rgb.astype(np.float32)
+        for channel in range(3):
+            cleaned[:, :, channel] += alpha * (255 - background_color[channel])
+        cleaned = np.clip(cleaned, 0, 255).astype(np.uint8)
+    else:
+        foreground_alpha = 1 - alpha
+        safe_alpha = np.maximum(foreground_alpha, 1 / 255)
+        cleaned = np.zeros((height, width, 4), dtype=np.uint8)
+        for channel in range(3):
+            unmatted = (rgb[:, :, channel].astype(np.float32) - alpha * background_color[channel]) / safe_alpha
+            cleaned[:, :, channel] = np.clip(unmatted, 0, 255).astype(np.uint8)
+        cleaned[:, :, :3][foreground_alpha < 0.01] = 0
+        cleaned[:, :, 3] = np.rint(foreground_alpha * 255).clip(0, 255).astype(np.uint8)
     output = BytesIO()
     Image.fromarray(cleaned).save(output, format="PNG")
     return output.getvalue(), detection
 
+def remove_background(path: Path) -> tuple[bytes, dict[str, object]]:
+    """Return a transparent PNG cutout for a scanned photo of any background."""
+    import cv2
+
+    detection = scan_image(path)
+    if detection["match"]:
+        return replace_black_background(path, "transparent")
+
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGBA")
+    canvas = Image.new("RGBA", image.size, (255, 255, 255, 255))
+    canvas.alpha_composite(image)
+    rgb = np.asarray(canvas.convert("RGB"))
+    height, width = rgb.shape[:2]
+    scale = min(1.0, 1400 / max(height, width))
+    small = cv2.resize(rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else rgb
+    sh, sw = small.shape[:2]
+    corner = max(1, round(min(sh, sw) * 0.05))
+    corner_pixels = np.concatenate((
+        small[:corner, :corner].reshape(-1, 3),
+        small[:corner, -corner:].reshape(-1, 3),
+        small[-corner:, :corner].reshape(-1, 3),
+        small[-corner:, -corner:].reshape(-1, 3),
+    ))
+    background_color = np.median(corner_pixels, axis=0).astype(np.float32)
+    distance = np.max(np.abs(small.astype(np.float32) - background_color), axis=2)
+    edge = max(2, round(min(sh, sw) * 0.025))
+    seeds = distance >= 55
+    seeds[:edge, :] = False
+    seeds[-edge:, :] = False
+    seeds[:, :edge] = False
+    seeds[:, -edge:] = False
+    if not seeds.any():
+        raise ValueError("Could not distinguish the product from its background.")
+
+    ys, xs = np.where(seeds)
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    pad_x = max(round(sw * 0.035), round((x1 - x0) * 0.08))
+    pad_y = max(round(sh * 0.035), round((y1 - y0) * 0.08))
+    x0, x1 = max(edge, x0 - pad_x), min(sw - edge, x1 + pad_x)
+    y0, y1 = max(edge, y0 - pad_y), min(sh - edge, y1 + pad_y)
+    mask = np.full((sh, sw), cv2.GC_PR_BGD, dtype=np.uint8)
+    mask[y0:y1, x0:x1] = cv2.GC_PR_FGD
+    mask[distance <= 12] = cv2.GC_BGD
+    mask[seeds] = cv2.GC_FGD
+    mask[:edge, :] = cv2.GC_BGD
+    mask[-edge:, :] = cv2.GC_BGD
+    mask[:, :edge] = cv2.GC_BGD
+    mask[:, -edge:] = cv2.GC_BGD
+    cv2.grabCut(
+        cv2.cvtColor(small, cv2.COLOR_RGB2BGR), mask, None,
+        np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64),
+        3, cv2.GC_INIT_WITH_MASK,
+    )
+    candidate = np.isin(mask, (cv2.GC_FGD, cv2.GC_PR_FGD)).astype(np.uint8)
+    _, components = cv2.connectedComponents(candidate, connectivity=8)
+    keep = np.unique(components[seeds])
+    keep = keep[keep != 0]
+    candidate = np.isin(components, keep).astype(np.uint8)
+    # Restore labels and other light details enclosed inside the product.
+    enclosed = cv2.bitwise_not(candidate * 255)
+    flood = enclosed.copy()
+    cv2.floodFill(flood, np.zeros((sh + 2, sw + 2), np.uint8), (0, 0), 0)
+    candidate |= (flood > 0).astype(np.uint8)
+    if not 0.001 <= float(candidate.mean()) <= 0.95:
+        raise ValueError("Could not reliably separate the product from its background.")
+
+    foreground = candidate.astype(np.float32)
+    if scale < 1:
+        foreground = cv2.resize(foreground, (width, height), interpolation=cv2.INTER_LINEAR)
+    foreground = cv2.GaussianBlur(foreground, (0, 0), 0.8).clip(0, 1)
+    # Recover the original edge colour from pixels already blended with the backdrop.
+    bg = np.median(np.concatenate((
+        rgb[:max(1, round(min(height, width) * 0.05)), :max(1, round(min(height, width) * 0.05))].reshape(-1, 3),
+        rgb[-max(1, round(min(height, width) * 0.05)):, -max(1, round(min(height, width) * 0.05)):].reshape(-1, 3),
+    )), axis=0).astype(np.float32)
+    local_foreground = cv2.erode(rgb, np.ones((13, 13), np.uint8)).astype(np.float32)
+    observed = rgb.astype(np.float32) - bg
+    nearby = local_foreground - bg
+    denominator = np.sum(nearby * nearby, axis=2)
+    estimated = np.clip(np.sum(observed * nearby, axis=2) / np.maximum(denominator, 1), 0, 1)
+    hard_foreground = foreground >= 0.5
+    band = (cv2.dilate(hard_foreground.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0) & (
+        cv2.dilate((~hard_foreground).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+    )
+    foreground[band & (denominator > 400)] = estimated[band & (denominator > 400)]
+    foreground = foreground.clip(0, 1)
+    result = np.zeros((height, width, 4), dtype=np.uint8)
+    safe_alpha = np.maximum(foreground, 1 / 255)
+    for channel in range(3):
+        unmatted = (rgb[:, :, channel].astype(np.float32) - (1 - foreground) * bg[channel]) / safe_alpha
+        result[:, :, channel] = np.clip(unmatted, 0, 255).astype(np.uint8)
+    result[:, :, :3][foreground < 0.01] = 0
+    result[:, :, 3] = np.rint(foreground * 255).clip(0, 255).astype(np.uint8)
+    output = BytesIO()
+    Image.fromarray(result).save(output, format="PNG")
+    return output.getvalue(), detection
+
 PAGE = r"""
 <h1>Black Background Scanner</h1>
-<p class="hint">Finds photos with mostly black borders and at least 3 dark corners. Convert All to White creates PNG copies with white backgrounds and downloads one ZIP. Original photos stay unchanged.</p>
+<p class="hint">Finds photos with mostly black borders and at least 3 dark corners. Convert All to White changes only black-background photos. Remove Background makes transparent PNGs from every scanned photo, including white-background photos. Each option downloads its own ZIP; original photos stay unchanged.</p>
 <section class="panel">
   <div class="grid">
     <div class="field full"><label for="blackFiles">Upload photos</label><input id="blackFiles" type="file" accept=".jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff" multiple><span class="hint">Up to 20 photos, 15 MB each.</span></div>
@@ -207,7 +334,7 @@ PAGE = r"""
     <div class="field full"><label for="blackFolder">Folder on server</label><input id="blackFolder" placeholder="Enter folder path"></div>
     <div class="field full"><label class="check"><input type="checkbox" id="blackRecursive" checked> Include subfolders</label></div>
   </div>
-  <div class="actions"><button id="blackScanBtn" type="button">Scan photos</button><button id="blackConvertAllBtn" class="mutedbtn" type="button" disabled>Convert All to White &amp; Download ZIP</button><button id="blackCopyBtn" class="mutedbtn" type="button">Copy black background paths / URLs</button><button id="blackExportBtn" class="mutedbtn" type="button">Export CSV</button></div>
+  <div class="actions"><button id="blackScanBtn" type="button">Scan photos</button><button id="blackConvertAllBtn" class="mutedbtn" type="button" disabled>Convert All to White &amp; Download ZIP</button><button id="blackTransparentAllBtn" class="mutedbtn" type="button" disabled>Remove Background (Transparent PNG) &amp; Download ZIP</button><button id="blackCopyBtn" class="mutedbtn" type="button">Copy black background paths / URLs</button><button id="blackExportBtn" class="mutedbtn" type="button">Export CSV</button></div>
   <div class="progress" id="blackProgress"><div class="track"><div class="bar" id="blackProgressBar"></div></div><div class="label" id="blackProgressLabel">Waiting...</div></div>
   <div class="status" id="status"></div>
 </section>
@@ -229,6 +356,7 @@ PAGE = r"""
   function render() {
     const hits=rows.filter(row=>row.match===true);
     byId("blackConvertAllBtn").disabled=!scanReady || batchRunning || hits.length===0;
+    byId("blackTransparentAllBtn").disabled=!scanReady || batchRunning || !rows.some(row=>row.status!=="error");
     byId("blackScanned").textContent=rows.length;
     byId("blackFound").textContent=hits.length;
     byId("blackIssues").textContent=rows.filter(row=>row.status==="error").length;
@@ -271,14 +399,15 @@ PAGE = r"""
     } catch(error) { message(error.message); progress(100,"Scan stopped.",false); }
     finally { byId("blackScanBtn").disabled=false; }
   });
-  byId("blackConvertAllBtn").addEventListener("click",async()=>{
+  const convertAll = async background => {
     if (!scanReady || batchRunning) return;
-    const hits=rows.filter(row=>row.match===true);
-    if (!hits.length) { message("No black background photos to convert."); return; }
+    const targets=background==="transparent"?rows.filter(row=>row.status!=="error"):rows.filter(row=>row.match===true);
+    if (!targets.length) { message(background==="transparent"?"No photos to process.":"No black background photos to convert."); return; }
     const form=new FormData();
-    form.append("manifest",JSON.stringify(hits.map(row=>({source:row.source,path:row.path,url:row.url,uploadIndex:row.uploadIndex}))));
+    form.append("manifest",JSON.stringify(targets.map(row=>({source:row.source,path:row.path,url:row.url,uploadIndex:row.uploadIndex}))));
+    form.append("background",background);
     const appended=new Set();
-    for (const row of hits) {
+    for (const row of targets) {
       if (row.source!=="upload") continue;
       const index=Number(row.uploadIndex);
       const file=uploadedFiles[index];
@@ -299,16 +428,19 @@ PAGE = r"""
           if (!data.ok) throw new Error(data.message || "Batch conversion failed.");
           const link=document.createElement("a");
           link.href="/api/scan-black-background/convert-all/download?id="+encodeURIComponent(started.job_id);
-          link.download="White_Background.zip";
+          link.download=background==="transparent"?"Transparent_Background.zip":"White_Background.zip";
           document.body.appendChild(link); link.click(); link.remove();
-          message("Converted "+(data.created || 0)+" photo(s). ZIP download started. Errors: "+(data.issues || 0)+".");
+          message("Converted "+(data.created || 0)+" photo(s) to "+(background==="transparent"?"transparent PNG":"white background")+". ZIP download started. Errors: "+(data.issues || 0)+".");
           break;
         }
         await new Promise(resolve=>setTimeout(resolve,1200));
       }
     } catch(error) { message(error.message); progress(100,"Conversion stopped.",false); }
     finally { batchRunning=false; render(); }
-  });  byId("blackCopyBtn").addEventListener("click",async()=>{
+  };
+  byId("blackConvertAllBtn").addEventListener("click",()=>convertAll("white"));
+  byId("blackTransparentAllBtn").addEventListener("click",()=>convertAll("transparent"));
+  byId("blackCopyBtn").addEventListener("click",async()=>{
     const paths=rows.filter(row=>row.match).map(row=>row.url || row.path).filter(Boolean);
     if (!paths.length) { message("No black background photos to copy."); return; }
     try { await navigator.clipboard.writeText(paths.join("\n")); message("Copied "+paths.length+" paths/URLs."); }

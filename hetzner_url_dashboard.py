@@ -795,13 +795,14 @@ def cleanup_black_background_batch_outputs() -> None:
         path.unlink(missing_ok=True)
 
 
-def run_black_background_convert_batch(job_id: str, items: list[dict[str, object]]) -> None:
-    from black_background_scanner import download_image, replace_black_background
+def run_black_background_convert_batch(job_id: str, items: list[dict[str, object]], background: str) -> None:
+    from black_background_scanner import download_image, remove_background, replace_black_background
 
     output_path = None
     errors: list[dict[str, str]] = []
     used_names: set[str] = set()
     created = 0
+    folder_name = "Transparent_Background" if background == "transparent" else "White_Background"
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temporary:
             output_path = Path(temporary.name)
@@ -817,16 +818,16 @@ def run_black_background_convert_batch(job_id: str, items: list[dict[str, object
                         path = temporary_path
                     else:
                         path = Path(str(item["path"]))
-                    cleaned, _ = replace_black_background(path)
+                    cleaned, _ = remove_background(path) if background == "transparent" else replace_black_background(path, "white")
                     stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(name).stem).strip(".-_") or "image"
-                    base_name = f"{stem}-white-background"
+                    base_name = f"{stem}-{background}-background"
                     output_name = f"{base_name}.png"
                     number = 2
                     while output_name.lower() in used_names:
                         output_name = f"{base_name}-{number}.png"
                         number += 1
                     used_names.add(output_name.lower())
-                    archive.writestr(f"White_Background/{output_name}", cleaned, compress_type=zipfile.ZIP_STORED)
+                    archive.writestr(f"{folder_name}/{output_name}", cleaned, compress_type=zipfile.ZIP_STORED)
                     created += 1
                 except Exception as exc:
                     errors.append({"file": name, "source": str(item["source"]), "error": str(exc)})
@@ -837,7 +838,7 @@ def run_black_background_convert_batch(job_id: str, items: list[dict[str, object
                            message=f"Processed {index}/{len(items)}: {created} converted, {len(errors)} errors",
                            created=created, issues=len(errors))
             if errors:
-                archive.writestr("White_Background/errors.json", json.dumps(errors, indent=2, ensure_ascii=False).encode("utf-8"))
+                archive.writestr(f"{folder_name}/errors.json", json.dumps(errors, indent=2, ensure_ascii=False).encode("utf-8"))
         if created == 0:
             raise ValueError("No photos could be converted. Check the scan results and source files.")
         update_job(job_id, done=True, ok=True, phase="complete", percent=100,
@@ -1690,9 +1691,9 @@ STYLE = """
 <style>
 :root{--bg:#f5f7fb;--panel:#fff;--ink:#111827;--muted:#667085;--line:#d7dde8;--accent:#0f766e;--blue:#1d4ed8}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Segoe UI,Arial,sans-serif;letter-spacing:0}
-.app{display:grid;grid-template-columns:280px 1fr;min-height:100vh}.side{background:#111827;color:white;padding:22px 16px}.brand-wrap{display:grid;gap:12px;margin-bottom:42px}.logo-row{display:flex;align-items:center}.brand-logo{display:block;object-fit:contain}.brand-logo.primex{max-width:228px;max-height:64px}.brand{font-size:20px;font-weight:800}.meta{font-size:12px;color:#a7b0c0;word-break:break-word;margin-bottom:18px}
+.app{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}.side{position:fixed;top:0;left:0;width:280px;height:100vh;overflow-y:auto;background:#111827;color:white;padding:22px 16px}.brand-wrap{display:grid;gap:12px;margin-bottom:42px}.logo-row{display:flex;align-items:center}.brand-logo{display:block;object-fit:contain}.brand-logo.primex{max-width:228px;max-height:64px}.brand{font-size:20px;font-weight:800}.meta{font-size:12px;color:#a7b0c0;word-break:break-word;margin-bottom:18px}
 .nav a{display:flex;align-items:center;gap:10px;color:#e5e7eb;text-decoration:none;padding:11px 10px;border-radius:8px;margin:5px 0;font-weight:700}.nav a.active,.nav a:hover{background:#263244}.nav svg{width:18px;height:18px;stroke:currentColor;stroke-width:2;fill:none;stroke-linecap:round;stroke-linejoin:round;flex:0 0 auto}
-main{padding:28px;max-width:1500px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:16px;box-shadow:0 10px 28px rgba(16,24,40,.07)}
+main{grid-column:2;padding:28px;max-width:1500px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;margin-bottom:16px;box-shadow:0 10px 28px rgba(16,24,40,.07)}
 h1{font-size:28px;margin:0 0 5px}.hint{color:var(--muted);font-size:14px;line-height:1.45}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.field{display:grid;gap:7px}.field.full{grid-column:1/-1}
 label{font-size:13px;font-weight:750}select,input{width:100%;border:1px solid var(--line);border-radius:8px;padding:10px 11px;font:inherit;background:white}.checks{display:flex;gap:18px;align-items:center;flex-wrap:wrap}.check{display:flex;align-items:center;gap:8px}.check input{width:auto}
 datalist option{font:inherit}
@@ -1703,7 +1704,7 @@ textarea{width:100%;min-height:220px;border:1px solid var(--line);border-radius:
 table{width:100%;border-collapse:collapse;background:white;border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:8px 9px;font-size:13px;vertical-align:top}th{background:#f8fafc}td{word-break:break-word}.status{padding:10px 12px;border-left:4px solid var(--accent);background:#eef7f5;border-radius:0 8px 8px 0;margin:12px 0;display:block}.status:empty{display:none}#usersTable{overflow-x:auto}#usersTable table{min-width:1260px}
 .progress{display:none;margin-top:12px}.progress .track{height:12px;background:#e5e7eb;border-radius:999px;overflow:hidden}.progress .bar{width:0;height:100%;background:var(--accent);transition:width .2s ease}.progress.active .bar{background:linear-gradient(90deg,var(--accent),#22c55e,var(--accent));background-size:180% 100%;animation:slide 1.2s linear infinite}.progress .label{font-size:13px;color:var(--muted);margin-top:7px}@keyframes slide{from{background-position:0 0}to{background-position:180% 0}}
 .image-drop{border:2px dashed var(--line);border-radius:8px;padding:22px;text-align:center;cursor:pointer;background:#f8fafc;display:grid;gap:5px}.image-drop.dragging,.image-drop:focus{border-color:var(--accent);background:#eef7f5;outline:none}.image-drop span{color:var(--muted);font-size:13px}.image-drop input{margin:8px auto 0;max-width:420px}.image-preview{max-width:min(100%,360px);max-height:260px;object-fit:contain;border:1px solid var(--line);border-radius:8px;margin-top:14px;background:#fff}
-@media(max-width:900px){.app{grid-template-columns:1fr}.grid,.cards,.profile-grid{grid-template-columns:1fr}.side{position:relative}.top-account{position:static;display:flex;justify-content:flex-end;margin:-12px 0 14px}.account-main{padding-top:20px!important}}
+@media(max-width:900px){.app{grid-template-columns:1fr}.grid,.cards,.profile-grid{grid-template-columns:1fr}.side{position:relative;top:auto;left:auto;width:auto;height:auto;overflow:visible}main{grid-column:1}.top-account{position:static;display:flex;justify-content:flex-end;margin:-12px 0 14px}.account-main{padding-top:20px!important}}
 </style>
 """
 
@@ -2776,13 +2777,14 @@ class Handler(BaseHTTPRequestHandler):
                 with JOBS_LOCK:
                     job = JOBS.get(job_id)
                     output_text = str(job.get("output_path", "")) if job and job.get("kind") == "black_background_batch" and job.get("owner") == owner and job.get("done") and job.get("ok") else ""
+                    filename = str(job.get("filename", "White_Background.zip")) if output_text else "White_Background.zip"
                 output_path = Path(output_text) if output_text else None
                 if output_path is None or not output_path.is_file():
                     self.send_json({"error": "Batch ZIP is not ready or has expired."}, 404)
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Disposition", 'attachment; filename="White_Background.zip"')
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 self.send_header("Cache-Control", "private, no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Content-Length", str(output_path.stat().st_size))
@@ -3158,6 +3160,9 @@ class Handler(BaseHTTPRequestHandler):
                     fp=self.rfile, headers=self.headers,
                     environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)},
                 )
+                background = form.getfirst("background", "white")
+                if background not in {"white", "transparent"}:
+                    raise ValueError("Background must be white or transparent.")
                 manifest_text = form.getfirst("manifest", "")
                 if not isinstance(manifest_text, str) or len(manifest_text) > 2 * 1024 * 1024:
                     raise ValueError("Batch list is too large.")
@@ -3214,10 +3219,11 @@ class Handler(BaseHTTPRequestHandler):
                 with JOBS_LOCK:
                     JOBS[job_id] = {
                         "kind": "black_background_batch", "owner": owner, "done": False, "ok": True,
+                        "filename": "Transparent_Background.zip" if background == "transparent" else "White_Background.zip",
                         "phase": "queued", "message": f"Preparing {len(items)} photo(s)...",
                         "percent": 3, "created": 0, "issues": 0, "rows": [], "started": time.time(),
                     }
-                threading.Thread(target=run_black_background_convert_batch, args=(job_id, items), daemon=True).start()
+                threading.Thread(target=run_black_background_convert_batch, args=(job_id, items, background), daemon=True).start()
                 self.send_json({"job_id": job_id, "count": len(items)})
                 return
             if route == "/api/scan-black-background":

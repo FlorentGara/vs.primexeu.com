@@ -783,6 +783,129 @@ def riegel_file_scan_row(path: Path) -> dict[str, object]:
         return {"source": "folder", "file": path.name, "path": str(path), "status": "error", "match": False, "message": str(exc)}
 
 
+def cleanup_black_background_batch_outputs() -> None:
+    expired = []
+    with JOBS_LOCK:
+        for job_id, job in list(JOBS.items()):
+            if job.get("kind") == "black_background_batch" and job.get("done") and time.time() - float(job.get("finished_at", 0)) > 86400:
+                if job.get("output_path"):
+                    expired.append(Path(str(job["output_path"])))
+                del JOBS[job_id]
+    for path in expired:
+        path.unlink(missing_ok=True)
+
+
+def run_black_background_convert_batch(job_id: str, items: list[dict[str, object]]) -> None:
+    from black_background_scanner import download_image, replace_black_background
+
+    output_path = None
+    errors: list[dict[str, str]] = []
+    used_names: set[str] = set()
+    created = 0
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temporary:
+            output_path = Path(temporary.name)
+        with zipfile.ZipFile(output_path, "w", allowZip64=True) as archive:
+            for index, item in enumerate(items, 1):
+                name = str(item["file"])
+                temporary_path = None
+                update_job(job_id, phase="converting", percent=5 + int((index - 1) * 90 / len(items)),
+                           message=f"Converting {index}/{len(items)}: {name}", created=created, issues=len(errors))
+                try:
+                    if item["source"] == "url":
+                        temporary_path = download_image(str(item["url"]))
+                        path = temporary_path
+                    else:
+                        path = Path(str(item["path"]))
+                    cleaned, _ = replace_black_background(path)
+                    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(name).stem).strip(".-_") or "image"
+                    base_name = f"{stem}-white-background"
+                    output_name = f"{base_name}.png"
+                    number = 2
+                    while output_name.lower() in used_names:
+                        output_name = f"{base_name}-{number}.png"
+                        number += 1
+                    used_names.add(output_name.lower())
+                    archive.writestr(f"White_Background/{output_name}", cleaned, compress_type=zipfile.ZIP_STORED)
+                    created += 1
+                except Exception as exc:
+                    errors.append({"file": name, "source": str(item["source"]), "error": str(exc)})
+                finally:
+                    if temporary_path is not None:
+                        temporary_path.unlink(missing_ok=True)
+                update_job(job_id, phase="converting", percent=5 + int(index * 90 / len(items)),
+                           message=f"Processed {index}/{len(items)}: {created} converted, {len(errors)} errors",
+                           created=created, issues=len(errors))
+            if errors:
+                archive.writestr("White_Background/errors.json", json.dumps(errors, indent=2, ensure_ascii=False).encode("utf-8"))
+        if created == 0:
+            raise ValueError("No photos could be converted. Check the scan results and source files.")
+        update_job(job_id, done=True, ok=True, phase="complete", percent=100,
+                   message=f"Finished: {created} converted photo(s), {len(errors)} error(s).",
+                   created=created, issues=len(errors), rows=errors, output_path=str(output_path), finished_at=time.time())
+    except Exception as exc:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+        update_job(job_id, done=True, ok=False, phase="error", percent=100,
+                   message=str(exc), created=created, issues=len(errors) or 1, rows=errors, finished_at=time.time())
+    finally:
+        for item in items:
+            if item["source"] == "upload":
+                Path(str(item["path"])).unlink(missing_ok=True)
+
+def run_black_background_scan_job(job_id: str, items: list[dict[str, object]]) -> None:
+    from black_background_scanner import scan_image, download_image
+
+    rows: list[dict[str, object]] = []
+    try:
+        total = len(items)
+        for index, item in enumerate(items, 1):
+            source = str(item["source"])
+            name = str(item["file"])
+            temporary_path = None
+            try:
+                if source == "url":
+                    temporary_path = download_image(str(item["url"]))
+                    path = temporary_path
+                else:
+                    path = Path(str(item["path"]))
+                result = scan_image(path)
+                rows.append({
+                    "source": source, "file": name,
+                    "path": str(item.get("display_path", item.get("url", item.get("path", "")))),
+                    "url": str(item.get("url", "")), "uploadIndex": item.get("uploadIndex"), **result,
+                })
+            except Exception as exc:
+                rows.append({
+                    "source": source, "file": name,
+                    "path": str(item.get("display_path", item.get("url", item.get("path", "")))),
+                    "url": str(item.get("url", "")),
+                    "status": "error", "match": False, "message": str(exc),
+                })
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+                if source == "upload":
+                    Path(str(item["path"])).unlink(missing_ok=True)
+            found = sum(row.get("match") is True for row in rows)
+            issues = sum(row.get("status") == "error" for row in rows)
+            update_job(
+                job_id, phase="scanning", percent=5 + int(index * 90 / total),
+                message=f"Scanned {index}/{total}: {found} black background, {issues} errors",
+                rows=list(rows), scanned=index, found=found, issues=issues,
+            )
+        update_job(
+            job_id, done=True, ok=True, phase="complete", percent=100,
+            message=f"Finished: {found} of {total} photos have a black background.",
+            rows=rows, scanned=total, found=found, issues=issues,
+        )
+    except Exception as exc:
+        update_job(job_id, done=True, ok=False, phase="error", percent=100, message=str(exc), rows=rows)
+    finally:
+        for item in items:
+            if item["source"] == "upload":
+                Path(str(item["path"])).unlink(missing_ok=True)
+
 def cleanup_riegel_batch_outputs() -> None:
     expired = []
     with JOBS_LOCK:
@@ -1593,6 +1716,7 @@ def shell(title: str, active: str, main: str) -> bytes:
         "urls": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path></svg>',
         "excel": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"></path><path d="M14 2v6h6"></path><path d="M8 13h8"></path><path d="M8 17h5"></path></svg>',
         "riegel": '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path><path d="M8 11h6"></path><path d="M11 8v6"></path></svg>',
+        "black": '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"></rect><circle cx="12" cy="12" r="5"></circle></svg>',
         "gewicht": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16"></path><path d="M6 20 9 8h6l3 12"></path><circle cx="12" cy="5" r="2"></circle></svg>',
         "database": '<svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"></ellipse><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"></path></svg>',
     }
@@ -1616,6 +1740,7 @@ def shell(title: str, active: str, main: str) -> bytes:
         <a class="{'active' if active == 'resizer' else ''}" href="/image-resizer">{icons['grid']}<span>Image Resizer</span></a>
         <a class="{'active' if active == 'database' else ''}" href="/database-project">{icons['database']}<span>Database Project</span></a>
         <a class="{'active' if active == 'vk-prices' else ''}" href="/vk-price-updater">{icons['excel']}<span>VK Price Updater</span></a>
+        <a class="{'active' if active == 'black' else ''}" href="/black-background-scanner">{icons['black']}<span>Black Background Scanner</span></a>
       </nav>
       <a class="account-nav {'active' if active == 'account' else ''}" href="/account" aria-label="Account and profile"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M5 20a7 7 0 0 1 14 0"></path><circle cx="12" cy="12" r="10"></circle></svg><span>Account &amp; profile</span></a>
       <a class="logout" href="/logout">Sign out</a>
@@ -2558,6 +2683,10 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/riegel-logo-scanner":
                 self.send_html(shell("Riegel Logo Scanner", "riegel", RIEGEL_PAGE))
                 return
+            if route == "/black-background-scanner":
+                from black_background_scanner import PAGE
+                self.send_html(shell("Black Background Scanner", "black", PAGE))
+                return
             if route == "/database-project":
                 from database_project import PAGE
                 self.send_html(shell("Database Project", "database", PAGE))
@@ -2639,6 +2768,27 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": "Amazon result is not ready or has expired."}, 404)
                 else:
                     self.send_download(Path(output_path), filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                return
+            if route == "/api/scan-black-background/convert-all/download":
+                cleanup_black_background_batch_outputs()
+                job_id = parse_qs(parsed.query).get("id", [""])[0]
+                owner = str((self.current_user() or {}).get("username", ""))
+                with JOBS_LOCK:
+                    job = JOBS.get(job_id)
+                    output_text = str(job.get("output_path", "")) if job and job.get("kind") == "black_background_batch" and job.get("owner") == owner and job.get("done") and job.get("ok") else ""
+                output_path = Path(output_text) if output_text else None
+                if output_path is None or not output_path.is_file():
+                    self.send_json({"error": "Batch ZIP is not ready or has expired."}, 404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", 'attachment; filename="White_Background.zip"')
+                self.send_header("Cache-Control", "private, no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Length", str(output_path.stat().st_size))
+                self.end_headers()
+                with output_path.open("rb") as archive:
+                    shutil.copyfileobj(archive, self.wfile)
                 return
             if route == "/api/scan-riegel-logo/remove-all/download":
                 cleanup_riegel_batch_outputs()
@@ -2996,6 +3146,134 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     if temporary_path is not None:
                         temporary_path.unlink(missing_ok=True)
+                return
+            if route == "/api/scan-black-background/convert-all":
+                from black_background_scanner import IMAGE_EXTENSIONS
+
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                content_type = self.headers.get("Content-Type", "")
+                if not content_type.startswith("multipart/form-data") or length > 82 * 1024 * 1024:
+                    raise ValueError("Expected a batch upload of at most 82 MB.")
+                form = cgi.FieldStorage(
+                    fp=self.rfile, headers=self.headers,
+                    environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)},
+                )
+                manifest_text = form.getfirst("manifest", "")
+                if not isinstance(manifest_text, str) or len(manifest_text) > 2 * 1024 * 1024:
+                    raise ValueError("Batch list is too large.")
+                try:
+                    manifest = json.loads(manifest_text)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("Invalid batch list.") from exc
+                if not isinstance(manifest, list) or not 1 <= len(manifest) <= 3020:
+                    raise ValueError("Choose 1 to 3020 matched photos.")
+                items = []
+                try:
+                    for entry in manifest:
+                        if not isinstance(entry, dict):
+                            raise ValueError("Invalid batch entry.")
+                        source = str(entry.get("source", ""))
+                        if source == "upload":
+                            index = int(entry.get("uploadIndex", -1))
+                            if not 0 <= index < 20:
+                                raise ValueError("Invalid uploaded photo index.")
+                            key = f"upload_{index}"
+                            field = form[key] if key in form else None
+                            if field is None or isinstance(field, list) or not getattr(field, "filename", ""):
+                                raise ValueError("An uploaded photo is missing. Scan again and retry.")
+                            filename = safe_upload_filename(field.filename)
+                            suffix = Path(filename).suffix.lower()
+                            if suffix not in IMAGE_EXTENSIONS:
+                                raise ValueError(f"Unsupported image format: {filename}")
+                            data = field.file.read(15 * 1024 * 1024 + 1)
+                            if len(data) > 15 * 1024 * 1024:
+                                raise ValueError(f"Image is larger than 15 MB: {filename}")
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
+                                temporary.write(data)
+                                items.append({"source": "upload", "file": filename, "path": temporary.name})
+                        elif source == "folder":
+                            path = Path(str(entry.get("path", "")))
+                            if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+                                raise ValueError(f"Image path is unavailable: {path}")
+                            items.append({"source": "folder", "file": path.name, "path": str(path)})
+                        elif source == "url":
+                            url = str(entry.get("url", ""))
+                            if not url.lower().startswith(("http://", "https://")):
+                                raise ValueError("Only http/https image URLs are supported.")
+                            items.append({"source": "url", "file": Path(urlparse(url).path).name or "image.jpg", "url": url})
+                        else:
+                            raise ValueError("Invalid photo source in batch.")
+                except Exception:
+                    for item in items:
+                        if item["source"] == "upload":
+                            Path(str(item["path"])).unlink(missing_ok=True)
+                    raise
+                cleanup_black_background_batch_outputs()
+                job_id = secrets.token_urlsafe(16)
+                owner = str((self.current_user() or {}).get("username", ""))
+                with JOBS_LOCK:
+                    JOBS[job_id] = {
+                        "kind": "black_background_batch", "owner": owner, "done": False, "ok": True,
+                        "phase": "queued", "message": f"Preparing {len(items)} photo(s)...",
+                        "percent": 3, "created": 0, "issues": 0, "rows": [], "started": time.time(),
+                    }
+                threading.Thread(target=run_black_background_convert_batch, args=(job_id, items), daemon=True).start()
+                self.send_json({"job_id": job_id, "count": len(items)})
+                return
+            if route == "/api/scan-black-background":
+                from black_background_scanner import IMAGE_EXTENSIONS, local_image_files
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                content_type = self.headers.get("Content-Type", "")
+                if not content_type.startswith("multipart/form-data") or length > 82 * 1024 * 1024:
+                    raise ValueError("Expected image upload of at most 82 MB.")
+                form = cgi.FieldStorage(
+                    fp=self.rfile, headers=self.headers,
+                    environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)},
+                )
+                items: list[dict[str, object]] = []
+                try:
+                    fields = form["files"] if "files" in form else []
+                    if not isinstance(fields, list):
+                        fields = [fields]
+                    if len(fields) > 20:
+                        raise ValueError("Choose at most 20 uploaded photos.")
+                    for upload_index, field in enumerate(fields):
+                        filename = safe_upload_filename(getattr(field, "filename", ""))
+                        suffix = Path(filename).suffix.lower()
+                        if suffix not in IMAGE_EXTENSIONS:
+                            raise ValueError(f"Unsupported image format: {filename}")
+                        data = field.file.read(15 * 1024 * 1024 + 1)
+                        if len(data) > 15 * 1024 * 1024:
+                            raise ValueError(f"Image is larger than 15 MB: {filename}")
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
+                            temporary.write(data)
+                            items.append({"source": "upload", "file": filename, "path": temporary.name, "display_path": filename, "uploadIndex": upload_index})
+                    urls = [line.strip() for line in re.split(r"[\r\n]+", form.getfirst("urls", "")) if line.strip()]
+                    for url in dict.fromkeys(urls[:1000]):
+                        if not url.lower().startswith(("http://", "https://")):
+                            raise ValueError("Only http/https image URLs are supported.")
+                        items.append({"source": "url", "file": Path(urlparse(url).path).name or url, "url": url})
+                    folder = form.getfirst("folder", "").strip()
+                    if folder:
+                        files = local_image_files(folder, form.getfirst("recursive", "1") == "1")
+                        items.extend({"source": "folder", "file": path.name, "path": str(path)} for path in files[:2000])
+                    if not items:
+                        raise ValueError("Choose photos, URLs, or a folder to scan.")
+                except Exception:
+                    for item in items:
+                        if item["source"] == "upload":
+                            Path(str(item["path"])).unlink(missing_ok=True)
+                    raise
+                job_id = secrets.token_urlsafe(12)
+                with JOBS_LOCK:
+                    JOBS[job_id] = {
+                        "kind": "black_background", "done": False, "ok": True,
+                        "phase": "queued", "message": f"Preparing {len(items)} photo(s)...",
+                        "percent": 3, "scanned": 0, "found": 0, "issues": 0,
+                        "rows": [], "started": time.time(),
+                    }
+                threading.Thread(target=run_black_background_scan_job, args=(job_id, items), daemon=True).start()
+                self.send_json({"job_id": job_id, "count": len(items)})
                 return
             if route == "/api/scan-riegel-logo":
                 length = int(self.headers.get("Content-Length", "0") or "0")

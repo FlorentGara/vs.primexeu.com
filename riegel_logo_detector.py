@@ -23,11 +23,12 @@ OVERLAP_REFERENCE_PATH = Path(__file__).resolve().parent / "static" / "riegel-lo
 PALE_REFERENCE_PATHS = tuple(Path(__file__).resolve().parent / "static" / name for name in (
     "riegel-logo-pale-gold.png", "riegel-logo-pale-rose.png", "riegel-logo-pale-bottle.png",
 ))
+EXAMPLE_REFERENCE_PATHS = tuple(sorted((Path(__file__).resolve().parent / 'static' / 'riegel-logo-examples').glob('*.png')))
 SCALES = (0.4, 0.5, 0.6, 0.75, 0.9, 1.0, 1.15, 1.35, 1.6, 2.0)
 MAX_SCAN_SIDE = 1200
 
 
-@lru_cache(maxsize=5)
+@lru_cache(maxsize=32)
 def reference(path: Path = REFERENCE_PATH):
     if Image is None or cv2 is None or np is None:
         raise RuntimeError("Logo localization requires Pillow, NumPy, and OpenCV.")
@@ -58,7 +59,7 @@ def feature_location(candidate_gray):
         return None
     matcher = cv2.BFMatcher()
     best = None
-    for reference_path in (REFERENCE_PATH, OVERLAP_REFERENCE_PATH, *PALE_REFERENCE_PATHS):
+    for reference_path in (REFERENCE_PATH, OVERLAP_REFERENCE_PATH, *PALE_REFERENCE_PATHS, *EXAMPLE_REFERENCE_PATHS):
         _, ref_gray, variants = reference(reference_path)
         for variant_name, ref_points, ref_descriptors in variants:
             pairs = matcher.knnMatch(ref_descriptors, descriptors, k=2)
@@ -124,6 +125,71 @@ def template_location(candidate_rgb, candidate_gray):
     return None, score, "template", REFERENCE_PATH.name
 
 
+def edge_location(candidate_gray):
+    # Match the lettering outline rather than bottle colour or brightness.
+    # The supplied watermark sits above the main product label.
+    _, ref_gray, _ = reference()
+    reference_edges = cv2.Canny(ref_gray, 30, 100)
+    candidate_edges = cv2.Canny(candidate_gray, 30, 100)
+    image_height, image_width = candidate_gray.shape
+    best = (0.0, None)
+    for scale in (0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0):
+        width = round(ref_gray.shape[1] * scale)
+        height = round(ref_gray.shape[0] * scale)
+        if width > image_width or height > image_height or width < image_width * 0.34:
+            continue
+        template = cv2.resize(reference_edges, (width, height))
+        result_width = image_width - width + 1
+        result_height = image_height - height + 1
+        left = max(0, round(image_width * 0.28 - width / 2))
+        right = min(result_width, round(image_width * 0.72 - width / 2) + 1)
+        top = max(0, round(image_height * 0.18))
+        bottom = min(result_height, round(image_height * 0.44) + 1)
+        if left >= right or top >= bottom:
+            continue
+        region = candidate_edges[top:bottom + height - 1, left:right + width - 1]
+        result = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
+        _, score, _, (local_x, local_y) = cv2.minMaxLoc(result)
+        if score > best[0]:
+            x, y = left + local_x, top + local_y
+            best = (score, (x, y, x + width, y + height))
+    score, box = best
+    if box is not None and score >= 0.22:
+        return tuple(float(value) for value in box), score, 'edge template', REFERENCE_PATH.name
+    return None
+
+
+def example_location(candidate_gray):
+    image_height, image_width = candidate_gray.shape
+    best = (0.0, None, None)
+    for reference_path in EXAMPLE_REFERENCE_PATHS:
+        _, ref_gray, _ = reference(reference_path)
+        for scale in (0.75, 1.0, 1.35, 1.8):
+            width = round(ref_gray.shape[1] * scale)
+            height = round(ref_gray.shape[0] * scale)
+            if width > image_width or height > image_height:
+                continue
+            template = cv2.resize(ref_gray, (width, height), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+            result_width = image_width - width + 1
+            result_height = image_height - height + 1
+            left = max(0, round(image_width * 0.28 - width / 2))
+            right = min(result_width, round(image_width * 0.72 - width / 2) + 1)
+            top = max(0, round(image_height * 0.18))
+            bottom = min(result_height, round(image_height * 0.55) + 1)
+            if left >= right or top >= bottom:
+                continue
+            region = candidate_gray[top:bottom + height - 1, left:right + width - 1]
+            result = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
+            _, score, _, (local_x, local_y) = cv2.minMaxLoc(result)
+            if score > best[0]:
+                x, y = left + local_x, top + local_y
+                best = (score, (x, y, x + width, y + height), reference_path.name)
+    score, box, reference_name = best
+    if box is not None and score >= 0.9:
+        return tuple(float(value) for value in box), score, 'example template', reference_name
+    return None
+
+
 def annotated_preview(image, box):
     thumbnail = image.copy()
     thumbnail.thumbnail((420, 420), Image.Resampling.LANCZOS)
@@ -155,6 +221,10 @@ def detect_logo(path: Path) -> dict[str, object]:
             candidate = cv2.resize(candidate, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA)
         candidate_gray = cv2.cvtColor(candidate, cv2.COLOR_RGB2GRAY)
         found = feature_location(candidate_gray)
+        if found is None:
+            found = example_location(candidate_gray)
+        if found is None:
+            found = edge_location(candidate_gray)
         if found is None:
             box, score, method, reference_name = template_location(candidate, candidate_gray)
         else:

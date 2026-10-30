@@ -29,3 +29,6 @@ Thumbs.db
 # Local VS Tools runtime logs
 logs/vs-tools.*.log
 logs/*.sqlite3*
+
+# Local inpainting model (downloaded separately)
+/models/*.onnx

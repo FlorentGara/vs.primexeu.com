@@ -8,3 +8,5 @@ requests
 selenium
 xlrd
 opencv-python-headless>=4.10,<6
+onnxruntime>=1.20,<2
+onnx>=1.17,<2

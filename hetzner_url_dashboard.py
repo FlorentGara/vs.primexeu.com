@@ -783,6 +783,76 @@ def riegel_file_scan_row(path: Path) -> dict[str, object]:
         return {"source": "folder", "file": path.name, "path": str(path), "status": "error", "match": False, "message": str(exc)}
 
 
+def cleanup_riegel_batch_outputs() -> None:
+    expired = []
+    with JOBS_LOCK:
+        for job_id, job in list(JOBS.items()):
+            if job.get("kind") == "riegel_batch" and job.get("done") and time.time() - float(job.get("finished_at", 0)) > 86400:
+                if job.get("output_path"):
+                    expired.append(Path(str(job["output_path"])))
+                del JOBS[job_id]
+    for path in expired:
+        path.unlink(missing_ok=True)
+
+
+def run_riegel_remove_batch(job_id: str, items: list[dict[str, object]]) -> None:
+    from riegel_logo_remover import remove_detected_logo
+    output_path = None
+    errors = []
+    used_names: set[str] = set()
+    created = 0
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temporary:
+            output_path = Path(temporary.name)
+        with zipfile.ZipFile(output_path, "w", allowZip64=True) as archive:
+            for index, item in enumerate(items, 1):
+                name = str(item["file"])
+                url_temporary = None
+                update_job(job_id, phase="removing", percent=5 + int((index - 1) * 90 / len(items)),
+                           message=f"Removing logo {index}/{len(items)}: {name}", created=created, issues=len(errors))
+                try:
+                    if item["source"] == "url":
+                        url_temporary = download_scan_image(str(item["url"]))
+                        source_path = url_temporary
+                    else:
+                        source_path = Path(str(item["path"]))
+                    cleaned, _ = remove_detected_logo(source_path)
+                    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(name).stem).strip(".-_") or "image"
+                    base_name = f"{stem}-no-riegel"
+                    output_name = f"{base_name}.png"
+                    number = 2
+                    while output_name.lower() in used_names:
+                        output_name = f"{base_name}-{number}.png"
+                        number += 1
+                    used_names.add(output_name.lower())
+                    archive.writestr(f"Riegel_No_Logo/{output_name}", cleaned, compress_type=zipfile.ZIP_STORED)
+                    created += 1
+                except Exception as exc:
+                    errors.append({"file": name, "source": item["source"], "error": str(exc)})
+                finally:
+                    if url_temporary is not None:
+                        url_temporary.unlink(missing_ok=True)
+                update_job(job_id, phase="removing", percent=5 + int(index * 90 / len(items)),
+                           message=f"Processed {index}/{len(items)}: {created} cleaned, {len(errors)} errors",
+                           created=created, issues=len(errors))
+            if errors:
+                archive.writestr("Riegel_No_Logo/errors.json", json.dumps(errors, indent=2, ensure_ascii=False).encode("utf-8"))
+        if created == 0:
+            raise ValueError("No photos could be cleaned. Check the scan results and source files.")
+        update_job(job_id, done=True, ok=True, phase="complete", percent=100,
+                   message=f"Finished: {created} cleaned photo(s), {len(errors)} error(s).",
+                   created=created, issues=len(errors), rows=errors, output_path=str(output_path), finished_at=time.time())
+    except Exception as exc:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+        update_job(job_id, done=True, ok=False, phase="error", percent=100,
+                   message=str(exc), created=created, issues=len(errors) or 1, rows=errors, finished_at=time.time())
+    finally:
+        for item in items:
+            if item["source"] == "upload":
+                Path(str(item["path"])).unlink(missing_ok=True)
+
+
 def update_riegel_job_progress(job_id: str, rows: list[dict[str, object]], index: int, total: int, current: str) -> None:
     found = sum(1 for row in rows if row.get("match") is True)
     issues = sum(1 for row in rows if row.get("status") in {"error", "skipped"})
@@ -1835,7 +1905,7 @@ GEWICHT_PAGE = """
 
 RIEGEL_PAGE = r"""
 <h1>Riegel Logo Scanner</h1>
-<p class="hint">Find the supplied Riegel bioweine logo in photos. Results show whether it appears, its pixel location, and an image preview with the match outlined. Photos are not edited.</p>
+<p class="hint">Find the supplied Riegel bioweine logo in photos. Results show whether it appears, its pixel location, and an image preview with the match outlined. Original photos stay unchanged. Remove &amp; Download uses a free local inpainting model to fill the logo area and downloads a PNG copy. Check the preview, especially where the logo covers printed label text. The first removal can take longer while the model loads. Remove All downloads one ZIP containing a Riegel_No_Logo folder with every cleaned match.</p>
 <section class="panel">
   <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:16px">
     <img src="/assets/riegel-logo-reference.png" width="163" height="80" alt="Riegel bioweine reference logo" style="background:#fff;border:1px solid var(--line);border-radius:8px;object-fit:contain">
@@ -1847,7 +1917,7 @@ RIEGEL_PAGE = r"""
     <div class="field full"><label for="riegelFolder">Folder path on the server</label><input id="riegelFolder" placeholder="Example: Y:\05_CLIENTS\02_VS\10_DESIGN\01_WINE-SPIRITS\25_Riegel_V_PROJECT\ALL IMAGES"></div>
     <div class="field full"><div class="checks"><label class="check"><input type="checkbox" id="riegelRecursive" checked> Include subfolders</label></div></div>
   </div>
-  <div class="actions"><button id="riegelScanBtn">Scan for Riegel Logo</button><button class="mutedbtn" id="copyRiegelHitsBtn">Copy Found Paths / URLs</button><button class="mutedbtn" id="exportRiegelHitsBtn">Export Found CSV</button></div>
+  <div class="actions"><button id="riegelScanBtn">Scan for Riegel Logo</button><button class="mutedbtn" id="riegelRemoveAllBtn" disabled>Remove All &amp; Download ZIP</button><button class="mutedbtn" id="copyRiegelHitsBtn">Copy Found Paths / URLs</button><button class="mutedbtn" id="exportRiegelHitsBtn">Export Found CSV</button></div>
   <div class="progress" id="riegelProgress"><div class="track"><div class="bar" id="riegelProgressBar"></div></div><div class="label" id="riegelProgressLabel">Waiting...</div></div>
   <div class="status" id="status"></div>
 </section>
@@ -1861,6 +1931,9 @@ RIEGEL_PAGE = r"""
 SCRIPT = """
 <script>
 let currentRows = [];
+let riegelUploadFiles = [];
+let riegelBatchRunning = false;
+let riegelScanReady = false;
 let topFolderCache = [];
 let currentProducts = [];
 const productFolderCache = {};
@@ -1945,7 +2018,7 @@ function setExcelProgress(percent,label,active=false){const wrap=document.getEle
 async function fillExcelUrls(){const file=document.getElementById("excelFile").files[0]; if(!file){status("Choose an Excel file.");return;} const form=new FormData(); form.append("file",file); form.append("top",document.getElementById("excelTopFolder").value); form.append("prefix",document.getElementById("excelPrefix").value); form.append("suffix",document.getElementById("excelSuffix").value); form.append("cache_bust",document.getElementById("excelCacheBust")?.checked?"1":"0"); status("Uploading Excel file..."); setExcelProgress(5,"Uploading Excel file..."); const result=await new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest(); xhr.open("POST","/api/fill-excel"); xhr.responseType="blob"; xhr.upload.onprogress=(event)=>{if(event.lengthComputable)setExcelProgress(Math.round((event.loaded/event.total)*50),`Uploading Excel: ${Math.round((event.loaded/event.total)*100)}%`);}; xhr.upload.onload=()=>setExcelProgress(65,"Server is filling columns and checking URLs...",true); xhr.onload=()=>{if(xhr.status>=200&&xhr.status<300){let stats={}; try{stats=JSON.parse(xhr.getResponseHeader("X-Excel-Url-Stats")||"{}");}catch(err){} resolve({blob:xhr.response,stats});return;} const reader=new FileReader(); reader.onload=()=>{try{reject(new Error(JSON.parse(reader.result).error||"Excel fill failed"));}catch(err){reject(new Error("Excel fill failed"));}}; reader.readAsText(xhr.response);}; xhr.onerror=()=>reject(new Error("Excel upload connection failed.")); xhr.send(form);}); const a=document.createElement("a"); a.href=URL.createObjectURL(result.blob); const baseName=file.name.replace(/^(?:filled-)+/i,""); a.download=`filled-${baseName}`; a.click(); URL.revokeObjectURL(a.href); const stats=result.stats||{}; const checked=Number(stats.checked||0); const invalid=Number(stats.invalid||0); const valid=Number(stats.valid||0); const missingProducts=Array.isArray(stats.missing_products)?stats.missing_products:[]; const missingText=missingProducts.length?` Missing products: ${missingProducts.join(", ")}.`:""; setExcelProgress(100,"Finished. Download started.",false); status(checked?`Excel URLs filled. Checked ${checked} URL(s): ${valid} OK, ${invalid} error(s).${missingText} Download started.`:"Excel URLs filled. Download started.");}
 function setRiegelProgress(percent,label,active=false){const wrap=document.getElementById("riegelProgress"); const bar=document.getElementById("riegelProgressBar"); const text=document.getElementById("riegelProgressLabel"); if(!wrap||!bar||!text)return; wrap.style.display="block"; wrap.classList.toggle("active",active); bar.style.width=`${Math.max(0,Math.min(100,percent))}%`; text.textContent=label;}
 function riegelHits(){return currentRows.filter(row=>row.match===true);}
-function updateRiegelCounts(){const scanned=document.getElementById("riegelScannedCount"); const found=document.getElementById("riegelFoundCount"); const errors=document.getElementById("riegelErrorCount"); if(scanned)scanned.textContent=String(currentRows.length); if(found)found.textContent=String(riegelHits().length); if(errors)errors.textContent=String(currentRows.filter(row=>["error","skipped"].includes(String(row.status||"").toLowerCase())).length);}
+function updateRiegelCounts(){const batch=document.getElementById("riegelRemoveAllBtn");if(batch)batch.disabled=!riegelScanReady||riegelBatchRunning||riegelHits().length===0;const scanned=document.getElementById("riegelScannedCount"); const found=document.getElementById("riegelFoundCount"); const errors=document.getElementById("riegelErrorCount"); if(scanned)scanned.textContent=String(currentRows.length); if(found)found.textContent=String(riegelHits().length); if(errors)errors.textContent=String(currentRows.filter(row=>["error","skipped"].includes(String(row.status||"").toLowerCase())).length);}
 async function parseJsonResponse(res){const text=await res.text(); try{return JSON.parse(text||"{}");}catch(err){throw new Error(text.trim().startsWith("<")?"Server returned HTML instead of JSON. Try again after refresh.":"Server returned invalid JSON.");}}
 async function pollRiegelJob(jobId,prefixRows=[]){
   while(true){
@@ -1973,6 +2046,9 @@ async function scanRiegelLogos(){
     status("Choose up to 20 photos, 15 MB each and 80 MB in total.");return;
   }
   if(btn)btn.disabled=true;
+  currentRows.forEach(row=>{if(row.cleanedPreview)URL.revokeObjectURL(row.cleanedPreview);});
+  riegelUploadFiles=files;
+  riegelScanReady=false;
   currentRows=[]; renderRiegelTable(); updateRiegelCounts();
   setRiegelProgress(8,"Starting scan...",true);
   try{
@@ -1984,7 +2060,7 @@ async function scanRiegelLogos(){
       const response=await fetch("/api/scan-riegel-logo/uploads",{method:"POST",body:form});
       const data=await parseJsonResponse(response);
       if(!response.ok)throw new Error(data.error||"Photo scan failed");
-      uploaded=data.rows||[];
+      uploaded=data.rows||[]; uploaded.forEach((row,index)=>{row.uploadIndex=index;});
       currentRows=uploaded; renderRiegelTable(); updateRiegelCounts();
       setRiegelProgress(45,`Scanned ${uploaded.length} uploaded photo(s).`,true);
     }
@@ -1996,24 +2072,102 @@ async function scanRiegelLogos(){
       else {currentRows=[...uploaded,...(data.rows||[])];renderRiegelTable();updateRiegelCounts();}
     }
     setRiegelProgress(100,"Finished.",false);
+    riegelScanReady=true; updateRiegelCounts();
     status(`Scanned ${currentRows.length} image(s). Supplied Riegel logo found in ${riegelHits().length}. Errors/skips: ${currentRows.filter(row=>["error","skipped"].includes(row.status)).length}.`);
   }finally{if(btn)btn.disabled=false;}
+}
+async function pollRiegelBatch(jobId){
+  riegelBatchRunning=true;updateRiegelCounts();
+  try{
+    while(true){
+      const data=await api(`/api/job?id=${encodeURIComponent(jobId)}`);
+      const label=data.message||"Removing logos...";
+      setRiegelProgress(data.percent||5,label,!data.done);
+      status(`${label} Cleaned: ${data.created||0}. Errors: ${data.issues||0}.`);
+      if(data.done){
+        sessionStorage.removeItem("riegelBatchJob");
+        if(!data.ok)throw new Error(label);
+        const link=document.createElement("a");
+        link.href=`/api/scan-riegel-logo/remove-all/download?id=${encodeURIComponent(jobId)}`;
+        link.download="Riegel_No_Logo.zip";
+        document.body.appendChild(link);link.click();link.remove();
+        setRiegelProgress(100,"Finished. ZIP download started.",false);
+        status(`Cleaned ${data.created||0} photo(s). ZIP download started. Errors: ${data.issues||0}${data.issues?" (see errors.json inside ZIP)":""}.`);
+        return;
+      }
+      await new Promise(resolve=>setTimeout(resolve,1200));
+    }
+  }finally{riegelBatchRunning=false;updateRiegelCounts();}
+}
+async function removeAllRiegel(){
+  if(!riegelScanReady)throw new Error("Finish scanning before removing all logos.");
+  const hits=riegelHits();
+  if(!hits.length)throw new Error("No matched photos to clean.");
+  if(riegelBatchRunning)return;
+  const form=new FormData();
+  form.append("manifest",JSON.stringify(hits.map(row=>({source:row.source,path:row.path,url:row.url,uploadIndex:row.uploadIndex}))));
+  const appended=new Set();
+  for(const row of hits){
+    if(row.source!=="upload")continue;
+    const index=Number(row.uploadIndex);
+    const file=riegelUploadFiles[index];
+    if(!file)throw new Error("An uploaded photo is no longer available. Scan again and retry.");
+    if(!appended.has(index)){form.append(`upload_${index}`,file);appended.add(index);}
+  }
+  riegelBatchRunning=true;updateRiegelCounts();
+  setRiegelProgress(4,`Starting removal of ${hits.length} photo(s)...`,true);
+  status(`Starting removal of ${hits.length} matched photo(s)...`);
+  try{
+    const response=await fetch("/api/scan-riegel-logo/remove-all",{method:"POST",body:form});
+    const data=await parseJsonResponse(response);
+    if(!response.ok)throw new Error(data.error||"Batch removal could not start.");
+    sessionStorage.setItem("riegelBatchJob",data.job_id);
+    await pollRiegelBatch(data.job_id);
+  }finally{riegelBatchRunning=false;updateRiegelCounts();}
+}
+async function removeAndDownloadRiegel(index){
+  const row=currentRows[index];
+  if(!row||row.match!==true)throw new Error("Choose a result with the Riegel logo.");
+  const button=document.querySelector(`[data-riegel-remove-index="${index}"]`);
+  if(button){button.disabled=true;button.textContent="Removing...";}
+  status(`Rebuilding the image behind the Riegel logo in ${row.file||"image"}... The first run may take up to two minutes.`);
+  try{
+    let response;
+    if(row.source==="upload"){
+      const file=riegelUploadFiles[row.uploadIndex];
+      if(!file)throw new Error("The uploaded photo is no longer available. Scan it again.");
+      const form=new FormData();form.append("file",file);
+      response=await fetch("/api/scan-riegel-logo/remove",{method:"POST",body:form});
+    }else{
+      response=await fetch("/api/scan-riegel-logo/remove",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({source:row.source,path:row.path,url:row.url})});
+    }
+    if(!response.ok){const error=await parseJsonResponse(response);throw new Error(error.error||"Logo removal failed.");}
+    const blob=await response.blob();
+    const disposition=response.headers.get("Content-Disposition")||"";
+    const filename=disposition.match(/filename="([^"]+)"/)?.[1]||`${String(row.file||"image").replace(/\.[^.]+$/,"")}-no-riegel.png`;
+    if(row.cleanedPreview)URL.revokeObjectURL(row.cleanedPreview);
+    row.cleanedPreview=URL.createObjectURL(blob);
+    const link=document.createElement("a");link.href=row.cleanedPreview;link.download=filename;document.body.appendChild(link);link.click();link.remove();
+    renderRiegelTable();
+    status(`Cleaned copy of ${row.file||"image"} downloaded. Review the preview before using it.`);
+  }finally{if(button&&button.isConnected){button.disabled=false;button.textContent="Remove & Download";}}
 }
 function renderRiegelTable(){
   const wrap=document.getElementById("tableWrap");
   if(!wrap)return;
   if(!currentRows.length){wrap.textContent="No scan results.";return;}
-  const rows=currentRows.slice(0,1200).map(row=>{
+  const rows=currentRows.slice(0,1200).map((row,index)=>{
     const hit=row.match===true;
     const color=hit?"#b42318":(row.status==="error"?"#b42318":"#0f766e");
     const url=String(row.url||"");
     const link=/^https?:\/\//i.test(url)?`<a href="${escAttr(url)}" target="_blank" rel="noopener noreferrer">Open image</a>`:"";
     const preview=hit&&row.preview?`<img src="${escAttr(row.preview)}" alt="Riegel logo location in ${escAttr(row.file||"image")}" style="max-width:180px;max-height:180px;object-fit:contain;border:1px solid var(--line);border-radius:6px">`:"";
+    const clean=hit?`<button type="button" class="mutedbtn" data-riegel-remove-index="${index}">Remove &amp; Download</button>${row.cleanedPreview?`<div style="margin-top:8px"><img src="${escAttr(row.cleanedPreview)}" alt="Cleaned preview" style="max-width:180px;max-height:180px;object-fit:contain;border:1px solid var(--line);border-radius:6px"></div>`:""}`:"";
     const evidence=row.score?`${escAttr(row.method||"visual")} score ${escAttr(row.score)}`:(escAttr(row.text||""));
-    return `<tr><td>${escAttr(row.source||"")}</td><td>${escAttr(row.file||"")}</td><td><strong style="color:${color}">${escAttr(row.status||"")}</strong><div class="hint">${escAttr(row.message||"")}</div></td><td>${escAttr(row.position||"-")}</td><td>${preview}</td><td>${escAttr(row.path||"")}</td><td>${link}</td><td>${evidence}</td></tr>`;
+    return `<tr><td>${escAttr(row.source||"")}</td><td>${escAttr(row.file||"")}</td><td><strong style="color:${color}">${escAttr(row.status||"")}</strong><div class="hint">${escAttr(row.message||"")}</div></td><td>${escAttr(row.position||"-")}</td><td>${preview}</td><td>${clean}</td><td>${escAttr(row.path||"")}</td><td>${link}</td><td>${evidence}</td></tr>`;
   }).join("");
   const note=currentRows.length>1200?`<p class="hint">Showing first 1200 of ${currentRows.length} rows.</p>`:"";
-  wrap.innerHTML=`${note}<div style="overflow:auto"><table><thead><tr><th>Source</th><th>File</th><th>Status</th><th>Logo location</th><th>Preview</th><th>Path</th><th>URL</th><th>Evidence</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  wrap.innerHTML=`${note}<div style="overflow:auto"><table><thead><tr><th>Source</th><th>File</th><th>Status</th><th>Logo location</th><th>Preview</th><th>Remove / Download</th><th>Path</th><th>URL</th><th>Evidence</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 async function copyRiegelHits(){const hits=riegelHits().map(row=>row.url||row.path).filter(Boolean); if(!hits.length){status("No Riegel matches to copy.");return;} await navigator.clipboard.writeText([...new Set(hits)].join("\\n")); status(`Copied ${hits.length} Riegel match path(s)/URL(s).`);}
 function exportRiegelHits(){
@@ -2160,6 +2314,9 @@ async function calculateGewicht(){
 document.getElementById("gewichtBtn")?.addEventListener("click",()=>calculateGewicht().catch(err=>status(err.message)));
 document.getElementById("excelBtn")?.addEventListener("click",()=>fillExcelUrls().catch(err=>status(err.message)));
 document.getElementById("riegelScanBtn")?.addEventListener("click",()=>scanRiegelLogos().catch(err=>status(err.message)));
+document.getElementById("riegelRemoveAllBtn")?.addEventListener("click",()=>removeAllRiegel().catch(err=>status(err.message)));
+if(document.getElementById("riegelRemoveAllBtn")){const activeBatch=sessionStorage.getItem("riegelBatchJob");if(activeBatch)pollRiegelBatch(activeBatch).catch(err=>status(err.message));}
+document.getElementById("tableWrap")?.addEventListener("click",event=>{const button=event.target.closest("[data-riegel-remove-index]");if(button)removeAndDownloadRiegel(Number(button.dataset.riegelRemoveIndex)).catch(err=>status(err.message));});
 document.getElementById("copyRiegelHitsBtn")?.addEventListener("click",()=>copyRiegelHits().catch(err=>status(err.message)));
 document.getElementById("exportRiegelHitsBtn")?.addEventListener("click",exportRiegelHits);
 document.getElementById("copyUploadLinksBtn")?.addEventListener("click",()=>copyUploadLinks().catch(err=>status(err.message)));
@@ -2483,6 +2640,27 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.send_download(Path(output_path), filename, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 return
+            if route == "/api/scan-riegel-logo/remove-all/download":
+                cleanup_riegel_batch_outputs()
+                job_id = parse_qs(parsed.query).get("id", [""])[0]
+                owner = str((self.current_user() or {}).get("username", ""))
+                with JOBS_LOCK:
+                    job = JOBS.get(job_id)
+                    output_text = str(job.get("output_path", "")) if job and job.get("kind") == "riegel_batch" and job.get("owner") == owner and job.get("done") and job.get("ok") else ""
+                output_path = Path(output_text) if output_text else None
+                if output_path is None or not output_path.is_file():
+                    self.send_json({"error": "Batch ZIP is not ready or has expired."}, 404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", 'attachment; filename="Riegel_No_Logo.zip"')
+                self.send_header("Cache-Control", "private, no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Length", str(output_path.stat().st_size))
+                self.end_headers()
+                with output_path.open("rb") as archive:
+                    shutil.copyfileobj(archive, self.wfile)
+                return
             if route == "/api/job":
                 q = parse_qs(parsed.query)
                 job = job_snapshot(q.get("id", [""])[0])
@@ -2684,6 +2862,140 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise ValueError("Unsupported user-management action.")
                 self.send_json({"ok": True})
+                return
+            if route == "/api/scan-riegel-logo/remove-all":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                content_type = self.headers.get("Content-Type", "")
+                if not content_type.startswith("multipart/form-data") or length > 82 * 1024 * 1024:
+                    raise ValueError("Expected a batch upload of at most 82 MB.")
+                form = cgi.FieldStorage(
+                    fp=self.rfile,
+                    headers=self.headers,
+                    environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)},
+                )
+                manifest_text = form.getfirst("manifest", "")
+                if not isinstance(manifest_text, str) or len(manifest_text) > 2 * 1024 * 1024:
+                    raise ValueError("Batch list is too large.")
+                try:
+                    manifest = json.loads(manifest_text)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("Invalid batch list.") from exc
+                if not isinstance(manifest, list) or not 1 <= len(manifest) <= 3020:
+                    raise ValueError("Choose 1 to 3020 matched photos.")
+                items = []
+                try:
+                    for entry in manifest:
+                        if not isinstance(entry, dict):
+                            raise ValueError("Invalid batch entry.")
+                        source = str(entry.get("source", ""))
+                        if source == "upload":
+                            index = int(entry.get("uploadIndex", -1))
+                            if not 0 <= index < 20:
+                                raise ValueError("Invalid uploaded photo index.")
+                            key = f"upload_{index}"
+                            field = form[key] if key in form else None
+                            if field is None or isinstance(field, list) or not getattr(field, "filename", ""):
+                                raise ValueError("An uploaded photo is missing. Scan again and retry.")
+                            filename = safe_upload_filename(field.filename)
+                            suffix = Path(filename).suffix.lower()
+                            if suffix not in LOGO_SCAN_EXTENSIONS:
+                                raise ValueError(f"Unsupported image format: {filename}")
+                            data = field.file.read(15 * 1024 * 1024 + 1)
+                            if len(data) > 15 * 1024 * 1024:
+                                raise ValueError(f"Image is larger than 15 MB: {filename}")
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
+                                temporary.write(data)
+                                path = Path(temporary.name)
+                            items.append({"source": "upload", "file": filename, "path": str(path)})
+                        elif source == "folder":
+                            path = Path(str(entry.get("path", "")))
+                            if not path.is_file() or path.suffix.lower() not in LOGO_SCAN_EXTENSIONS:
+                                raise ValueError(f"Image path is unavailable: {path}")
+                            items.append({"source": "folder", "file": path.name, "path": str(path)})
+                        elif source == "url":
+                            url = str(entry.get("url", ""))
+                            if not url.lower().startswith(("http://", "https://")):
+                                raise ValueError("Only http/https image URLs are supported.")
+                            items.append({"source": "url", "file": Path(urlparse(url).path).name or "image.jpg", "url": url})
+                        else:
+                            raise ValueError("Invalid photo source in batch.")
+                except Exception:
+                    for item in items:
+                        if item["source"] == "upload":
+                            Path(str(item["path"])).unlink(missing_ok=True)
+                    raise
+                cleanup_riegel_batch_outputs()
+                job_id = secrets.token_urlsafe(16)
+                owner = str((self.current_user() or {}).get("username", ""))
+                with JOBS_LOCK:
+                    JOBS[job_id] = {"kind": "riegel_batch", "owner": owner, "done": False, "ok": True,
+                                    "phase": "queued", "message": f"Preparing {len(items)} photo(s)...", "percent": 3,
+                                    "created": 0, "issues": 0, "rows": [], "started": time.time()}
+                threading.Thread(target=run_riegel_remove_batch, args=(job_id, items), daemon=True).start()
+                self.send_json({"job_id": job_id, "count": len(items)})
+                return
+            if route == "/api/scan-riegel-logo/remove":
+                from riegel_logo_remover import remove_detected_logo
+
+                temporary_path = None
+                try:
+                    content_type = self.headers.get("Content-Type", "")
+                    if content_type.startswith("multipart/form-data"):
+                        length = int(self.headers.get("Content-Length", "0") or "0")
+                        if length > 16 * 1024 * 1024:
+                            raise ValueError("Image is larger than 15 MB.")
+                        form = cgi.FieldStorage(
+                            fp=self.rfile,
+                            headers=self.headers,
+                            environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)},
+                        )
+                        field = form["file"] if "file" in form else None
+                        if field is None or not getattr(field, "filename", ""):
+                            raise ValueError("Choose an image to remove the logo from.")
+                        original_name = safe_upload_filename(field.filename)
+                        suffix = Path(original_name).suffix.lower()
+                        if suffix not in LOGO_SCAN_EXTENSIONS:
+                            raise ValueError("Unsupported image format.")
+                        data = field.file.read(15 * 1024 * 1024 + 1)
+                        if len(data) > 15 * 1024 * 1024:
+                            raise ValueError("Image is larger than 15 MB.")
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
+                            temporary.write(data)
+                            temporary_path = Path(temporary.name)
+                        source_path = temporary_path
+                    elif content_type.startswith("application/json"):
+                        payload = self.read_json_body()
+                        source = str(payload.get("source", ""))
+                        if source == "url":
+                            url = str(payload.get("url", ""))
+                            if not url.lower().startswith(("http://", "https://")):
+                                raise ValueError("Only http/https image URLs are supported.")
+                            temporary_path = download_scan_image(url)
+                            source_path = temporary_path
+                            original_name = Path(urlparse(url).path).name or "image.jpg"
+                        elif source == "folder":
+                            source_path = Path(str(payload.get("path", "")))
+                            if not source_path.is_file() or source_path.suffix.lower() not in LOGO_SCAN_EXTENSIONS:
+                                raise ValueError("Image path does not exist or is not supported.")
+                            original_name = source_path.name
+                        else:
+                            raise ValueError("Choose a scanned image to remove the logo from.")
+                    else:
+                        raise ValueError("Expected an image upload or JSON source.")
+
+                    cleaned, _ = remove_detected_logo(source_path)
+                    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(original_name).stem).strip(".-_") or "image"
+                    output_name = f"{stem}-no-riegel.png"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Disposition", f'attachment; filename="{output_name}"')
+                    self.send_header("Cache-Control", "private, no-store")
+                    self.send_header("Content-Length", str(len(cleaned)))
+                    self.end_headers()
+                    self.wfile.write(cleaned)
+                finally:
+                    if temporary_path is not None:
+                        temporary_path.unlink(missing_ok=True)
                 return
             if route == "/api/scan-riegel-logo":
                 length = int(self.headers.get("Content-Length", "0") or "0")
@@ -3107,6 +3419,8 @@ def main() -> None:
         raise SystemExit(f"VS_ROOT does not exist: {VS_ROOT}")
     vs_users.initialize()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
+    from riegel_logo_remover import preload_model
+    threading.Thread(target=preload_model, name="riegel-inpaint-preload", daemon=True).start()
     print(f"VS Tools serving on http://{HOST}:{PORT}")
     print(f"Scanning {VS_ROOT}")
     server.serve_forever()

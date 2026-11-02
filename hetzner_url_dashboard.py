@@ -917,12 +917,13 @@ def cleanup_riegel_batch_outputs() -> None:
 
 
 def run_riegel_remove_batch(job_id: str, items: list[dict[str, object]]) -> None:
-    from riegel_logo_remover import remove_detected_logo
+    from riegel_logo_remover import _get_model, remove_detected_logo
     output_path = None
     errors = []
     used_names: set[str] = set()
     created = 0
     try:
+        _get_model()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as temporary:
             output_path = Path(temporary.name)
         with zipfile.ZipFile(output_path, "w", allowZip64=True) as archive:
@@ -954,12 +955,15 @@ def run_riegel_remove_batch(job_id: str, items: list[dict[str, object]]) -> None
                     if url_temporary is not None:
                         url_temporary.unlink(missing_ok=True)
                 update_job(job_id, phase="removing", percent=5 + int(index * 90 / len(items)),
-                           message=f"Processed {index}/{len(items)}: {created} cleaned, {len(errors)} errors",
-                           created=created, issues=len(errors))
+                           message=f"Processed {index}/{len(items)}: {created} cleaned, {len(errors)} errors"
+                                   + (f". First error: {errors[0]['error']}" if errors else ""),
+                           created=created, issues=len(errors), rows=errors[:3])
+                if created == 0 and len(errors) >= 3 and len({row["error"] for row in errors}) == 1:
+                    raise ValueError(f"Stopped after 3 identical failures: {errors[0]['error']}")
             if errors:
                 archive.writestr("Riegel_No_Logo/errors.json", json.dumps(errors, indent=2, ensure_ascii=False).encode("utf-8"))
         if created == 0:
-            raise ValueError("No photos could be cleaned. Check the scan results and source files.")
+            raise ValueError(f"No photos could be cleaned. First error: {errors[0]['error']}")
         update_job(job_id, done=True, ok=True, phase="complete", percent=100,
                    message=f"Finished: {created} cleaned photo(s), {len(errors)} error(s).",
                    created=created, issues=len(errors), rows=errors, output_path=str(output_path), finished_at=time.time())

@@ -647,13 +647,10 @@ def download_scan_image(url: str) -> Path:
     if suffix not in LOGO_SCAN_EXTENSIONS:
         suffix = ".jpg"
     request = Request(url, headers={"User-Agent": "VS-Tools-Riegel-Logo-Scan/1.0"})
-    with urlopen(request, timeout=20) as response:
-        data = response.read(15 * 1024 * 1024 + 1)
-    if len(data) > 15 * 1024 * 1024:
-        raise ValueError("Image is larger than 15 MB.")
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
-        temp.write(data)
+        with urlopen(request, timeout=20) as response:
+            shutil.copyfileobj(response, temp)
         temp.close()
         return Path(temp.name)
     except Exception:
@@ -666,7 +663,7 @@ def scan_riegel_sources(url_text: str, folder_text: str, recursive: bool) -> lis
     rows: list[dict[str, object]] = []
     urls = [line.strip() for line in re.split(r"[\r\n]+", url_text or "") if line.strip()]
     seen_urls: set[str] = set()
-    for url in urls[:1000]:
+    for url in urls:
         if url in seen_urls:
             continue
         seen_urls.add(url)
@@ -703,7 +700,7 @@ def scan_riegel_sources(url_text: str, folder_text: str, recursive: bool) -> lis
 
     if folder_text.strip():
         files = local_logo_scan_files(folder_text, recursive)
-        for path in files[:2000]:
+        for path in files:
             try:
                 result = detect_riegel_logo_in_image(path)
                 rows.append({
@@ -998,11 +995,11 @@ def run_riegel_scan_job(job_id: str, url_text: str, folder_text: str, recursive:
         urls = [line.strip() for line in re.split(r"[\r\n]+", url_text or "") if line.strip()]
         unique_urls = []
         seen_urls: set[str] = set()
-        for url in urls[:1000]:
+        for url in urls:
             if url not in seen_urls:
                 unique_urls.append(url)
                 seen_urls.add(url)
-        files = local_logo_scan_files(folder_text, recursive)[:2000] if folder_text.strip() else []
+        files = local_logo_scan_files(folder_text, recursive) if folder_text.strip() else []
         total = len(unique_urls) + len(files)
         if total == 0:
             raise ValueError("Paste image URLs or enter a folder path to scan.")
@@ -2038,10 +2035,8 @@ RIEGEL_PAGE = r"""
     <p class="hint">The scanner searches for this exact mark and lettering, including light versions printed on dark bottles.</p>
   </div>
   <div class="grid">
-    <div class="field full"><label for="riegelFiles">Upload photos</label><input id="riegelFiles" type="file" accept=".jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff" multiple><span class="hint">Up to 20 images, 15 MB each.</span></div>
+    <div class="field full"><label for="riegelFiles">Upload photos</label><input id="riegelFiles" type="file" accept=".jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff" multiple><span class="hint">Choose as many photos as needed.</span></div>
     <div class="field full"><label for="riegelUrls">Image URLs</label><textarea id="riegelUrls" placeholder="Paste one image URL per line..."></textarea></div>
-    <div class="field full"><label for="riegelFolder">Folder path on the server</label><input id="riegelFolder" placeholder="Example: Y:\05_CLIENTS\02_VS\10_DESIGN\01_WINE-SPIRITS\25_Riegel_V_PROJECT\ALL IMAGES"></div>
-    <div class="field full"><div class="checks"><label class="check"><input type="checkbox" id="riegelRecursive" checked> Include subfolders</label></div></div>
   </div>
   <div class="actions"><button id="riegelScanBtn">Scan for Riegel Logo</button><button class="mutedbtn" id="riegelRemoveAllBtn" disabled>Remove All &amp; Download ZIP</button><button class="mutedbtn" id="copyRiegelHitsBtn">Copy Found Paths / URLs</button><button class="mutedbtn" id="exportRiegelHitsBtn">Export Found CSV</button></div>
   <div class="progress" id="riegelProgress"><div class="track"><div class="bar" id="riegelProgressBar"></div></div><div class="label" id="riegelProgressLabel">Waiting...</div></div>
@@ -2163,14 +2158,9 @@ async function pollRiegelJob(jobId,prefixRows=[]){
 }
 async function scanRiegelLogos(){
   const urls=document.getElementById("riegelUrls").value;
-  const folder=document.getElementById("riegelFolder").value;
-  const recursive=document.getElementById("riegelRecursive").checked;
   const files=[...document.getElementById("riegelFiles").files];
   const btn=document.getElementById("riegelScanBtn");
-  if(!urls.trim()&&!folder.trim()&&!files.length){status("Choose photos, paste image URLs, or enter a folder path.");return;}
-  if(files.length>20||files.some(file=>file.size>15*1024*1024)||files.reduce((n,file)=>n+file.size,0)>80*1024*1024){
-    status("Choose up to 20 photos, 15 MB each and 80 MB in total.");return;
-  }
+  if(!urls.trim()&&!files.length){status("Choose photos or paste image URLs.");return;}
   if(btn)btn.disabled=true;
   currentRows.forEach(row=>{if(row.cleanedPreview)URL.revokeObjectURL(row.cleanedPreview);});
   riegelUploadFiles=files;
@@ -2180,18 +2170,28 @@ async function scanRiegelLogos(){
   try{
     let uploaded=[];
     if(files.length){
-      status(`Uploading and scanning ${files.length} photo(s)...`);
-      const form=new FormData();
-      files.forEach(file=>form.append("files",file));
-      const response=await fetch("/api/scan-riegel-logo/uploads",{method:"POST",body:form});
-      const data=await parseJsonResponse(response);
-      if(!response.ok)throw new Error(data.error||"Photo scan failed");
-      uploaded=data.rows||[]; uploaded.forEach((row,index)=>{row.uploadIndex=index;});
-      currentRows=uploaded; renderRiegelTable(); updateRiegelCounts();
-      setRiegelProgress(45,`Scanned ${uploaded.length} uploaded photo(s).`,true);
+      for(let start=0;start<files.length;){
+        const batch=[];
+        let batchBytes=0;
+        while(start+batch.length<files.length&&batch.length<20){
+          const file=files[start+batch.length];
+          if(batch.length&&batchBytes+file.size>70*1024*1024)break;
+          batch.push(file);batchBytes+=file.size;
+        }
+        status(`Uploading and scanning photos ${start+1}-${start+batch.length} of ${files.length}...`);
+        const form=new FormData();
+        batch.forEach(file=>form.append("files",file));
+        const response=await fetch("/api/scan-riegel-logo/uploads",{method:"POST",body:form});
+        const data=await parseJsonResponse(response);
+        if(!response.ok)throw new Error(data.error||"Photo scan failed");
+        (data.rows||[]).forEach((row,index)=>{row.uploadIndex=start+index;uploaded.push(row);});
+        start+=batch.length;
+        currentRows=uploaded;renderRiegelTable();updateRiegelCounts();
+        setRiegelProgress(8+Math.round(37*start/files.length),`Scanned ${start} of ${files.length} uploaded photo(s).`,true);
+      }
     }
-    if(urls.trim()||folder.trim()){
-      const response=await fetch("/api/scan-riegel-logo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({urls,folder,recursive})});
+    if(urls.trim()){
+      const response=await fetch("/api/scan-riegel-logo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({urls})});
       const data=await parseJsonResponse(response);
       if(!response.ok)throw new Error(data.error||"Riegel scan failed");
       if(data.job_id)await pollRiegelJob(data.job_id,uploaded);
@@ -2282,7 +2282,7 @@ function renderRiegelTable(){
   const wrap=document.getElementById("tableWrap");
   if(!wrap)return;
   if(!currentRows.length){wrap.textContent="No scan results.";return;}
-  const rows=currentRows.slice(0,1200).map((row,index)=>{
+  const rows=currentRows.map((row,index)=>{
     const hit=row.match===true;
     const color=hit?"#b42318":(row.status==="error"?"#b42318":"#0f766e");
     const url=String(row.url||"");
@@ -2292,8 +2292,7 @@ function renderRiegelTable(){
     const evidence=row.score?`${escAttr(row.method||"visual")} score ${escAttr(row.score)}`:(escAttr(row.text||""));
     return `<tr><td>${escAttr(row.source||"")}</td><td>${escAttr(row.file||"")}</td><td><strong style="color:${color}">${escAttr(row.status||"")}</strong><div class="hint">${escAttr(row.message||"")}</div></td><td>${escAttr(row.position||"-")}</td><td>${preview}</td><td>${clean}</td><td>${escAttr(row.path||"")}</td><td>${link}</td><td>${evidence}</td></tr>`;
   }).join("");
-  const note=currentRows.length>1200?`<p class="hint">Showing first 1200 of ${currentRows.length} rows.</p>`:"";
-  wrap.innerHTML=`${note}<div style="overflow:auto"><table><thead><tr><th>Source</th><th>File</th><th>Status</th><th>Logo location</th><th>Preview</th><th>Remove / Download</th><th>Path</th><th>URL</th><th>Evidence</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  wrap.innerHTML=`<div style="overflow:auto"><table><thead><tr><th>Source</th><th>File</th><th>Status</th><th>Logo location</th><th>Preview</th><th>Remove / Download</th><th>Path</th><th>URL</th><th>Evidence</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 async function copyRiegelHits(){const hits=riegelHits().map(row=>row.url||row.path).filter(Boolean); if(!hits.length){status("No Riegel matches to copy.");return;} await navigator.clipboard.writeText([...new Set(hits)].join("\\n")); status(`Copied ${hits.length} Riegel match path(s)/URL(s).`);}
 function exportRiegelHits(){
@@ -3018,22 +3017,22 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/scan-riegel-logo/remove-all":
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 content_type = self.headers.get("Content-Type", "")
-                if not content_type.startswith("multipart/form-data") or length > 82 * 1024 * 1024:
-                    raise ValueError("Expected a batch upload of at most 82 MB.")
+                if not content_type.startswith("multipart/form-data"):
+                    raise ValueError("Expected a batch upload.")
                 form = cgi.FieldStorage(
                     fp=self.rfile,
                     headers=self.headers,
                     environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)},
                 )
                 manifest_text = form.getfirst("manifest", "")
-                if not isinstance(manifest_text, str) or len(manifest_text) > 2 * 1024 * 1024:
-                    raise ValueError("Batch list is too large.")
+                if not isinstance(manifest_text, str):
+                    raise ValueError("Invalid batch list.")
                 try:
                     manifest = json.loads(manifest_text)
                 except json.JSONDecodeError as exc:
                     raise ValueError("Invalid batch list.") from exc
-                if not isinstance(manifest, list) or not 1 <= len(manifest) <= 3020:
-                    raise ValueError("Choose 1 to 3020 matched photos.")
+                if not isinstance(manifest, list) or not manifest:
+                    raise ValueError("Choose matched photos.")
                 items = []
                 try:
                     for entry in manifest:
@@ -3042,7 +3041,7 @@ class Handler(BaseHTTPRequestHandler):
                         source = str(entry.get("source", ""))
                         if source == "upload":
                             index = int(entry.get("uploadIndex", -1))
-                            if not 0 <= index < 20:
+                            if index < 0:
                                 raise ValueError("Invalid uploaded photo index.")
                             key = f"upload_{index}"
                             field = form[key] if key in form else None
@@ -3052,11 +3051,8 @@ class Handler(BaseHTTPRequestHandler):
                             suffix = Path(filename).suffix.lower()
                             if suffix not in LOGO_SCAN_EXTENSIONS:
                                 raise ValueError(f"Unsupported image format: {filename}")
-                            data = field.file.read(15 * 1024 * 1024 + 1)
-                            if len(data) > 15 * 1024 * 1024:
-                                raise ValueError(f"Image is larger than 15 MB: {filename}")
                             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
-                                temporary.write(data)
+                                shutil.copyfileobj(field.file, temporary)
                                 path = Path(temporary.name)
                             items.append({"source": "upload", "file": filename, "path": str(path)})
                         elif source == "folder":
@@ -3094,8 +3090,6 @@ class Handler(BaseHTTPRequestHandler):
                     content_type = self.headers.get("Content-Type", "")
                     if content_type.startswith("multipart/form-data"):
                         length = int(self.headers.get("Content-Length", "0") or "0")
-                        if length > 16 * 1024 * 1024:
-                            raise ValueError("Image is larger than 15 MB.")
                         form = cgi.FieldStorage(
                             fp=self.rfile,
                             headers=self.headers,
@@ -3108,11 +3102,8 @@ class Handler(BaseHTTPRequestHandler):
                         suffix = Path(original_name).suffix.lower()
                         if suffix not in LOGO_SCAN_EXTENSIONS:
                             raise ValueError("Unsupported image format.")
-                        data = field.file.read(15 * 1024 * 1024 + 1)
-                        if len(data) > 15 * 1024 * 1024:
-                            raise ValueError("Image is larger than 15 MB.")
                         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
-                            temporary.write(data)
+                            shutil.copyfileobj(field.file, temporary)
                             temporary_path = Path(temporary.name)
                         source_path = temporary_path
                     elif content_type.startswith("application/json"):
@@ -3298,8 +3289,6 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Image upload is larger than 25 MB.")
             if route.startswith("/api/vk-prices/") and int(self.headers.get("Content-Length", "0") or "0") > 26 * 1024 * 1024:
                 raise ValueError("Workbook upload is larger than 25 MB.")
-            if route == "/api/scan-riegel-logo/uploads" and int(self.headers.get("Content-Length", "0") or "0") > 80 * 1024 * 1024:
-                raise ValueError("Selected images are larger than 80 MB in total.")
             form = cgi.FieldStorage(
                 fp=self.rfile,
                 headers=self.headers,
@@ -3313,19 +3302,16 @@ class Handler(BaseHTTPRequestHandler):
                 fields = form["files"] if "files" in form else []
                 if not isinstance(fields, list):
                     fields = [fields]
-                if not fields or len(fields) > 20:
-                    raise ValueError("Choose 1 to 20 image files.")
+                if not fields:
+                    raise ValueError("Choose image files.")
                 rows = []
                 for field in fields:
                     filename = safe_upload_filename(getattr(field, "filename", ""))
                     suffix = Path(filename).suffix.lower()
                     if suffix not in LOGO_SCAN_EXTENSIONS:
                         raise ValueError(f"Unsupported image format: {filename}")
-                    data = field.file.read(15 * 1024 * 1024 + 1)
-                    if len(data) > 15 * 1024 * 1024:
-                        raise ValueError(f"Image is larger than 15 MB: {filename}")
                     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
-                        temporary.write(data)
+                        shutil.copyfileobj(field.file, temporary)
                         temporary_path = Path(temporary.name)
                     try:
                         row = riegel_file_scan_row(temporary_path)

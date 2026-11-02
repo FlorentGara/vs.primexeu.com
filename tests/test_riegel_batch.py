@@ -41,6 +41,38 @@ class QuietFiles(SimpleHTTPRequestHandler):
 
 
 class RiegelBatchTests(unittest.TestCase):
+    def test_upload_accepts_more_than_twenty_photos_and_large_photo(self):
+        api = ThreadingHTTPServer(('127.0.0.1', 0), AuthenticatedHandler)
+        thread = Thread(target=api.serve_forever, daemon=True)
+        thread.start()
+        try:
+            boundary = 'riegel-unlimited-test-boundary'
+            parts = []
+            for index in range(21):
+                parts.append(
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="files"; '
+                    f'filename="photo-{index}.png"\r\nContent-Type: image/png\r\n\r\n'.encode()
+                )
+                parts.append(b'x' * (16 * 1024 * 1024 if index == 20 else 1))
+                parts.append(b'\r\n')
+            parts.append(f'--{boundary}--\r\n'.encode())
+            request = Request(
+                f'http://127.0.0.1:{api.server_address[1]}/api/scan-riegel-logo/uploads',
+                data=b''.join(parts),
+                headers={'Content-Type': f'multipart/form-data; boundary={boundary}'},
+                method='POST',
+            )
+            with patch.object(app, 'riegel_file_scan_row', return_value={'match': False, 'status': 'no riegel'}):
+                with urlopen(request, timeout=30) as response:
+                    result = json.load(response)
+            self.assertEqual(result['scanned'], 21)
+            self.assertEqual(len(result['rows']), 21)
+            self.assertEqual(result['rows'][-1]['file'], 'photo-20.png')
+        finally:
+            api.shutdown()
+            api.server_close()
+            thread.join(timeout=2)
+
     def test_batch_zip_contains_upload_folder_and_url(self):
         fixture = Path(__file__).parent / 'fixtures' / 'riegel-faint-15863.png'
         source_bytes = fixture.read_bytes()

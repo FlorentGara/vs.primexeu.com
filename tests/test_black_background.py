@@ -172,13 +172,13 @@ class BlackBackgroundTests(unittest.TestCase):
         job_id = None
         try:
             root = f"http://127.0.0.1:{server.server_address[1]}"
-            source = photo_bytes("black", "white")
-            manifest = json.dumps([{"source": "upload", "uploadIndex": 0}])
+            source = photo_bytes("black", "white") + b"\0" * (16 * 1024 * 1024)
+            manifest = json.dumps([{"source": "upload", "uploadIndex": 499}])
             boundary = "transparent-batch-test-boundary"
             body = (
                 f'--{boundary}\r\nContent-Disposition: form-data; name="background"\r\n\r\ntransparent\r\n'
                 f'--{boundary}\r\nContent-Disposition: form-data; name="manifest"\r\n\r\n{manifest}\r\n'
-                f'--{boundary}\r\nContent-Disposition: form-data; name="upload_0"; filename="black.png"\r\n'
+                f'--{boundary}\r\nContent-Disposition: form-data; name="upload_499"; filename="black.png"\r\n'
                 f'Content-Type: image/png\r\n\r\n'
             ).encode() + source + f'\r\n--{boundary}--\r\n'.encode()
             request = Request(
@@ -301,14 +301,13 @@ class BlackBackgroundTests(unittest.TestCase):
             self.assertIn('id="blackTransparentAllBtn"', page)
             boundary = "black-background-test-boundary"
             parts = []
-            for name, background, center in (
-                ("black.png", "black", "white"),
-                ("white.png", "white", "black"),
-            ):
+            photos = [("black.png", "black", "white")]
+            photos += [(f"white-{i}.png", "white", "black") for i in range(499)]
+            for name, background, center in photos:
                 parts.append(
                     f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{name}"\r\n'
                     f'Content-Type: image/png\r\n\r\n'.encode()
-                    + photo_bytes(background, center) + b'\r\n'
+                    + photo_bytes(background, center) + (b"\0" * (16 * 1024 * 1024) if name == "black.png" else b"") + b'\r\n'
                 )
             body = b"".join(parts) + f"--{boundary}--\r\n".encode()
             request = Request(
@@ -319,7 +318,7 @@ class BlackBackgroundTests(unittest.TestCase):
             with urlopen(request, timeout=10) as response:
                 started = json.load(response)
             job_id = started["job_id"]
-            for _ in range(50):
+            for _ in range(300):
                 with urlopen(root + "/api/job?id=" + job_id, timeout=10) as response:
                     result = json.load(response)
                 if result["done"]:
@@ -327,9 +326,10 @@ class BlackBackgroundTests(unittest.TestCase):
                 time.sleep(0.1)
             self.assertTrue(result["done"])
             self.assertTrue(result["ok"], result["message"])
-            self.assertEqual(result["scanned"], 2)
+            self.assertEqual(result["scanned"], 500)
             self.assertEqual(result["found"], 1)
-            self.assertEqual([row["match"] for row in result["rows"]], [True, False])
+            self.assertEqual([row["match"] for row in result["rows"]], [True] + [False] * 499)
+            self.assertEqual(result["rows"][-1]["uploadIndex"], 499)
         finally:
             server.shutdown()
             server.server_close()

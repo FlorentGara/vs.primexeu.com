@@ -318,7 +318,7 @@ PAGE = r"""
 <p class="hint">Finds photos with mostly black borders and at least 3 dark corners. Convert All to White changes only black-background photos. Remove Background makes transparent PNGs from every scanned photo, including white-background photos. Each option downloads its own ZIP; original photos stay unchanged.</p>
 <section class="panel">
   <div class="grid">
-    <div class="field full"><label for="blackFiles">Upload photos</label><input id="blackFiles" type="file" accept=".jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff" multiple><span class="hint">Up to 20 photos, 15 MB each.</span></div>
+    <div class="field full"><label for="blackFiles">Upload photos</label><input id="blackFiles" type="file" accept=".jpg,.jpeg,.png,.webp,.gif,.bmp,.tif,.tiff" multiple><span class="hint">Up to 500 photos.</span></div>
   </div>
   <div class="actions"><button id="blackScanBtn" type="button">Scan photos</button><button id="blackConvertAllBtn" class="mutedbtn" type="button" disabled>Convert All to White &amp; Download ZIP</button><button id="blackTransparentAllBtn" class="mutedbtn" type="button" disabled>Remove Background (Transparent PNG) &amp; Download ZIP</button><button id="blackExportBtn" class="mutedbtn" type="button">Export CSV</button></div>
   <div class="progress" id="blackProgress"><div class="track"><div class="bar" id="blackProgressBar"></div></div><div class="label" id="blackProgressLabel">Waiting...</div></div>
@@ -364,7 +364,7 @@ PAGE = r"""
   byId("blackScanBtn").addEventListener("click",async()=>{
     const files=[...byId("blackFiles").files];
     if (!files.length) { message("Choose photos to scan."); return; }
-    if (files.length>20 || files.some(file=>file.size>15*1024*1024) || files.reduce((n,file)=>n+file.size,0)>80*1024*1024) { message("Choose up to 20 photos, 15 MB each and 80 MB total."); return; }
+    if (files.length>500) { message("Choose up to 500 photos."); return; }
     const form=new FormData();
     files.forEach(file=>form.append("files",file));
     byId("blackScanBtn").disabled=true; uploadedFiles=files; scanReady=false; rows=[]; render(); progress(3,"Starting scan...",true);

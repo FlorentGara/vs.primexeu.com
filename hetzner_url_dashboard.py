@@ -3154,8 +3154,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 content_type = self.headers.get("Content-Type", "")
-                if not content_type.startswith("multipart/form-data") or length > 82 * 1024 * 1024:
-                    raise ValueError("Expected a batch upload of at most 82 MB.")
+                if not content_type.startswith("multipart/form-data"):
+                    raise ValueError("Expected a batch upload.")
                 form = cgi.FieldStorage(
                     fp=self.rfile, headers=self.headers,
                     environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)},
@@ -3180,7 +3180,7 @@ class Handler(BaseHTTPRequestHandler):
                         source = str(entry.get("source", ""))
                         if source == "upload":
                             index = int(entry.get("uploadIndex", -1))
-                            if not 0 <= index < 20:
+                            if not 0 <= index < 500:
                                 raise ValueError("Invalid uploaded photo index.")
                             key = f"upload_{index}"
                             field = form[key] if key in form else None
@@ -3190,11 +3190,8 @@ class Handler(BaseHTTPRequestHandler):
                             suffix = Path(filename).suffix.lower()
                             if suffix not in IMAGE_EXTENSIONS:
                                 raise ValueError(f"Unsupported image format: {filename}")
-                            data = field.file.read(15 * 1024 * 1024 + 1)
-                            if len(data) > 15 * 1024 * 1024:
-                                raise ValueError(f"Image is larger than 15 MB: {filename}")
                             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
-                                temporary.write(data)
+                                shutil.copyfileobj(field.file, temporary)
                                 items.append({"source": "upload", "file": filename, "path": temporary.name})
                         else:
                             raise ValueError("Invalid photo source in batch.")
@@ -3220,8 +3217,8 @@ class Handler(BaseHTTPRequestHandler):
                 from black_background_scanner import IMAGE_EXTENSIONS
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 content_type = self.headers.get("Content-Type", "")
-                if not content_type.startswith("multipart/form-data") or length > 82 * 1024 * 1024:
-                    raise ValueError("Expected image upload of at most 82 MB.")
+                if not content_type.startswith("multipart/form-data"):
+                    raise ValueError("Expected image upload.")
                 form = cgi.FieldStorage(
                     fp=self.rfile, headers=self.headers,
                     environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type, "CONTENT_LENGTH": str(length)},
@@ -3231,18 +3228,15 @@ class Handler(BaseHTTPRequestHandler):
                     fields = form["files"] if "files" in form else []
                     if not isinstance(fields, list):
                         fields = [fields]
-                    if len(fields) > 20:
-                        raise ValueError("Choose at most 20 uploaded photos.")
+                    if len(fields) > 500:
+                        raise ValueError("Choose at most 500 uploaded photos.")
                     for upload_index, field in enumerate(fields):
                         filename = safe_upload_filename(getattr(field, "filename", ""))
                         suffix = Path(filename).suffix.lower()
                         if suffix not in IMAGE_EXTENSIONS:
                             raise ValueError(f"Unsupported image format: {filename}")
-                        data = field.file.read(15 * 1024 * 1024 + 1)
-                        if len(data) > 15 * 1024 * 1024:
-                            raise ValueError(f"Image is larger than 15 MB: {filename}")
                         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
-                            temporary.write(data)
+                            shutil.copyfileobj(field.file, temporary)
                             items.append({"source": "upload", "file": filename, "path": temporary.name, "display_path": filename, "uploadIndex": upload_index})
                     if not items:
                         raise ValueError("Choose photos to scan.")

@@ -44,7 +44,7 @@ except Exception:
 VS_ROOT = Path(os.environ.get("VS_ROOT", "/var/www/primexeu.com.shared/photos/VS")).resolve()
 APP_ROOT = Path(__file__).resolve().parent
 ASSET_ROOT = Path(os.environ.get("VS_DASHBOARD_ASSET_ROOT", str(APP_ROOT / "static"))).resolve()
-BASE_URL = os.environ.get("VS_BASE_URL", "https://primexeu.com/photos/VS/").rstrip("/") + "/"
+BASE_URL = os.environ.get("VS_BASE_URL", "https://vs.primexeu.com/photos/").rstrip("/") + "/"
 HOST = os.environ.get("VS_DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VS_DASHBOARD_PORT", "8791"))
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}

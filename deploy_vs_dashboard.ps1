@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$projectRoot = 'E:\websites\vs.primexeu.com'
+$projectRoot = 'H:\website\vs.primexeu.com'
 $logRoot = Join-Path $projectRoot 'logs'
 $git = 'C:\Program Files\Git\cmd\git.exe'
 $python = Join-Path $projectRoot '.venv\Scripts\python.exe'

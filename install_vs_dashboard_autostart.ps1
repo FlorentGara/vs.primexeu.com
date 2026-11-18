@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$projectRoot = 'E:\websites\vs.primexeu.com'
+$projectRoot = 'H:\website\vs.primexeu.com'
 $startupScript = Join-Path $projectRoot 'start_vs_dashboard.ps1'
 $deployScript = Join-Path $projectRoot 'deploy_vs_dashboard.ps1'
 $taskName = 'VS Primexeu Dashboard'

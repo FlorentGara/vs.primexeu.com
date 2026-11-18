@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$projectRoot = 'E:\websites\vs.primexeu.com'
+$projectRoot = 'H:\website\vs.primexeu.com'
 $logRoot = Join-Path $projectRoot 'logs'
 $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $app = Join-Path $projectRoot 'hetzner_url_dashboard.py'

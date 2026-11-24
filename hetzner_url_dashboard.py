@@ -2100,7 +2100,9 @@ async function uploadFiles(){
   const btn=document.getElementById("uploadBtn");
   if(!path.trim()){status("Enter destination path after VS/.");return;}
   if(!files.length){status("Choose files to upload.");return;}
-  const maxBatchBytes=75*1024*1024;
+  // Keep each request comfortably below common reverse-proxy body limits.
+  // Large selections are split into multiple requests, so total selection size is not constrained by this per-request ceiling.
+  const maxBatchBytes=20*1024*1024;
   const maxFileBytes=95*1024*1024;
   const tooLarge=files.find(file=>file.size>maxFileBytes);
   if(tooLarge){status(`${tooLarge.name} is larger than 95 MB. Upload it through a direct/DNS-only route or reduce its size.`);return;}
@@ -2116,7 +2118,7 @@ async function uploadFiles(){
   let years=0;
   let issues=0;
   const commonFields=form=>{form.append("path",path);form.append("overwrite",document.getElementById("overwriteFiles").checked?"1":"0");form.append("format",document.getElementById("autoFormat").value);form.append("delete",document.getElementById("autoDeleteSource").checked?"1":"0");form.append("cache_bust",document.getElementById("autoCacheBust")?.checked?"1":"0");form.append("quantities",[...document.querySelectorAll(".autoQty:checked")].map(q=>q.value).join(","));};
-  const sendForm=(form,onProgress)=>new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open("POST","/api/upload");xhr.timeout=30*60*1000;xhr.upload.onprogress=onProgress;xhr.onload=()=>{let payload={};try{payload=JSON.parse(xhr.responseText||"{}");}catch(err){reject(new Error(xhr.status===413?"Upload batch is too large.":`Upload returned invalid response (HTTP ${xhr.status}).`));return;}if(xhr.status>=200&&xhr.status<300)resolve(payload);else reject(new Error(payload.error||`Upload failed (HTTP ${xhr.status})`));};xhr.onerror=()=>reject(new Error("Upload connection failed."));xhr.ontimeout=()=>reject(new Error("Upload timed out after 30 minutes."));xhr.send(form);});
+  const sendForm=(form,onProgress)=>new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open("POST","/api/upload");xhr.timeout=30*60*1000;xhr.upload.onprogress=onProgress;xhr.onload=()=>{let payload={};try{payload=JSON.parse(xhr.responseText||"{}");}catch(err){const responseText=(xhr.responseText||"").trim();const detail=responseText.startsWith("<")?"The web server or proxy returned an HTML error page.":"The server returned an invalid response.";reject(new Error(xhr.status===413?"Upload batch is too large for the server.":`Upload request failed (HTTP ${xhr.status}). ${detail} Try fewer or smaller images, then retry.`));return;}if(xhr.status>=200&&xhr.status<300)resolve(payload);else reject(new Error(payload.error||`Upload failed (HTTP ${xhr.status})`));};xhr.onerror=()=>reject(new Error("Upload connection failed."));xhr.ontimeout=()=>reject(new Error("Upload timed out after 30 minutes."));xhr.send(form);});
   if(btn)btn.disabled=true;
   try{
     status(`Uploading ${files.length} file(s) in ${batches.length} safe batch(es)...`);
